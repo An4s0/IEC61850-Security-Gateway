@@ -28,10 +28,10 @@ def run(st, args):
 
     print("\nSending traffic...\n")
 
-    stnum = 1
+    stnum = st.get("stnum", 1)
     sqnum = 0
     values = [False] * st["num_entries"]
-    count = getattr(args, "count", 3)
+    count = max(getattr(args, "count", 2), 2)
 
     for i in range(count):
         t = time.time()

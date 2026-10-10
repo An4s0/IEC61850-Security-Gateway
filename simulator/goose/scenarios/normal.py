@@ -24,7 +24,7 @@ def run(st, args):
     print("\nTraffic Mode: Normal Baseline")
     print("Sending traffic...\n")
 
-    stnum = 1
+    stnum = st.get("stnum", 1)
     sqnum = 0
     values = [False] * st["num_entries"]
     time_allowed = st["max_time_ms"] * 2

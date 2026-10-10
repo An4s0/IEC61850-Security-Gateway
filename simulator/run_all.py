@@ -283,11 +283,14 @@ def main():
             # Pass context object (single stream for GOOSE/SV, full endpoints list for MMS)
             if protocol in ["GOOSE", "SV"]:
                 selected_stream = context_data[args.stream % len(context_data)]
+                if protocol == "GOOSE":
+                    selected_stream["stnum"] = selected_stream.get("stnum", 0) + 1
                 mod.run(selected_stream, scenario_args)
             elif protocol == "MMS":
                 mod.run(context_data, scenario_args)
 
             passed = True
+            time.sleep(0.15)
         except Exception as ex:
             passed = False
             err_msg = str(ex)
