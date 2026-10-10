@@ -1,19 +1,26 @@
 #include "http_api.h"
 #include "scd_storage.h"
 #include "scd_config.h"
+#include "system_config.h"
+#include "system_logger.h"
 #include "security.h"
 #include "fatfs.h"
 #include "ff.h"
 #include "lwip/tcp.h"
 #include "lwip/pbuf.h"
+#include "lwip/tcpip.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include "lwip/tcpip.h"
+#include <stdbool.h>
 
 #define HTTP_API_PORT 8080
 #define HTTP_API_REQUEST_BUFFER_SIZE 2048
+#define MAX_HTTP_CLIENTS 8
 #define MAX_SSE_CLIENTS 4
+#define MAX_ALERT_POOL 4
+
+#define BODY_CHUNK_SIZE 512
 
 static struct tcp_pcb *api_pcb = NULL;
 
@@ -25,41 +32,212 @@ typedef struct HTTP_API_Client_s
     uint32_t body_received;
     uint8_t header_complete;
     uint8_t post_active;
+    uint8_t post_config_active;
     uint8_t alerts_active;
+    int8_t alert_buf_idx;
     uint8_t is_sse;
+    uint8_t in_use;
+    uint32_t last_activity;
+    char *resp_buf;
+    uint32_t resp_len;
+    uint32_t resp_sent;
     struct tcp_pcb *pcb;
-    struct HTTP_API_Client_s *next;
+    struct HTTP_API_Client_s *next_sse;
 } HTTP_API_Client_t;
 
+static HTTP_API_Client_t s_clients[MAX_HTTP_CLIENTS];
 static HTTP_API_Client_t *sse_clients = NULL;
 static uint8_t sse_client_count = 0;
 
+#define ALERT_RESP_BUF_SIZE 22528
+#define NUM_ALERT_RESP_BUFS 2
+static char s_alert_resp_buffers[NUM_ALERT_RESP_BUFS][ALERT_RESP_BUF_SIZE];
+static uint8_t s_alert_buf_busy[NUM_ALERT_RESP_BUFS] = {0, 0};
+
+static int acquire_alert_resp_buffer(void)
+{
+    for (int i = 0; i < NUM_ALERT_RESP_BUFS; i++)
+    {
+        if (!s_alert_buf_busy[i])
+        {
+            s_alert_buf_busy[i] = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void release_alert_resp_buffer(int idx)
+{
+    if (idx >= 0 && idx < NUM_ALERT_RESP_BUFS)
+    {
+        s_alert_buf_busy[idx] = 0;
+    }
+}
+
+static volatile uint8_t s_scd_upload_active = 0;
+
+typedef struct
+{
+    char data[512];
+    uint16_t len;
+    uint8_t in_use;
+} SSE_Message_t;
+
+static SSE_Message_t s_alert_pool[MAX_ALERT_POOL];
+osMutexDef(AlertPoolMutex);
+static osMutexId s_alert_pool_mutex = NULL;
+
 static void api_close_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
-static void send_alerts_chunk(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
+static void api_abort_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
+static void stream_alerts_response(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
+static bool process_scd_data(struct tcp_pcb *pcb, HTTP_API_Client_t *client, const uint8_t *data, uint16_t len);
+static void finish_post(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
+
+/**
+ * @brief Allocates a client state slot from the static pool.
+ */
+static HTTP_API_Client_t *alloc_client(struct tcp_pcb *pcb)
+{
+    for (int i = 0; i < MAX_HTTP_CLIENTS; i++)
+    {
+        if (!s_clients[i].in_use)
+        {
+            memset(&s_clients[i], 0, sizeof(HTTP_API_Client_t));
+            s_clients[i].in_use = 1;
+            s_clients[i].alert_buf_idx = -1;
+            s_clients[i].pcb = pcb;
+            s_clients[i].last_activity = HAL_GetTick();
+            return &s_clients[i];
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief Releases a client state slot back to the static pool.
+ */
+static void free_client(HTTP_API_Client_t *client)
+{
+    if (client != NULL)
+    {
+        if (client->alert_buf_idx >= 0)
+        {
+            release_alert_resp_buffer(client->alert_buf_idx);
+            client->alert_buf_idx = -1;
+        }
+        client->alerts_active = 0;
+        client->in_use = 0;
+        client->pcb = NULL;
+    }
+}
+
+/**
+ * @brief Removes an SSE client from the active broadcast list.
+ */
+static void remove_sse_client(HTTP_API_Client_t *client)
+{
+    if (client != NULL && client->is_sse)
+    {
+        HTTP_API_Client_t **curr = &sse_clients;
+        while (*curr != NULL)
+        {
+            if (*curr == client)
+            {
+                *curr = client->next_sse;
+                if (sse_client_count > 0)
+                {
+                    sse_client_count--;
+                }
+                break;
+            }
+            curr = &((*curr)->next_sse);
+        }
+        client->is_sse = 0;
+        client->next_sse = NULL;
+    }
+}
 
 /**
  * @brief Callback invoked when data has been successfully transmitted.
- * @param arg User supplied argument.
- * @param pcb TCP protocol control block.
- * @param len Number of bytes acknowledged.
- * @return ERR_OK on success.
  */
 static err_t api_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
     (void)len;
     HTTP_API_Client_t *client = (HTTP_API_Client_t *)arg;
-    if (client != NULL && client->alerts_active)
+    if (client != NULL)
     {
-        send_alerts_chunk(pcb, client);
+        client->last_activity = HAL_GetTick();
+        if (client->alerts_active)
+        {
+            stream_alerts_response(pcb, client);
+        }
     }
     return ERR_OK;
 }
 
 /**
+ * @brief Periodic poll callback to detect stale connections and keep SSE alive.
+ */
+static err_t api_poll(void *arg, struct tcp_pcb *pcb)
+{
+    HTTP_API_Client_t *client = (HTTP_API_Client_t *)arg;
+    if (client == NULL)
+    {
+        tcp_abort(pcb);
+        return ERR_ABRT;
+    }
+
+    uint32_t now = HAL_GetTick();
+
+    if (client->alerts_active)
+    {
+        if (client->resp_sent >= client->resp_len)
+        {
+            client->alerts_active = 0;
+            api_close_conn(pcb, client);
+            return ERR_OK;
+        }
+        else
+        {
+            stream_alerts_response(pcb, client);
+        }
+    }
+
+    if (client->is_sse)
+    {
+        if (now - client->last_activity >= 5000)
+        {
+            client->last_activity = now;
+            const char *hb = ": keepalive\n\n";
+            err_t err = tcp_write(pcb, hb, (u16_t)strlen(hb), TCP_WRITE_FLAG_COPY);
+            if (err == ERR_OK)
+            {
+                tcp_output(pcb);
+            }
+            else
+            {
+                SysLog_Print(SYSLOG_LEVEL_DEBUG, "HTTP", "SSE keepalive failed (%d), aborting", err);
+                api_abort_conn(pcb, client);
+                return ERR_ABRT;
+            }
+        }
+    }
+    else
+    {
+        if (now - client->last_activity >= 15000)
+        {
+            SysLog_Print(SYSLOG_LEVEL_DEBUG, "HTTP", "Connection timed out, aborting");
+            api_abort_conn(pcb, client);
+            return ERR_ABRT;
+        }
+    }
+
+    return ERR_OK;
+}
+
+/**
  * @brief Locates the boundary between HTTP headers and body.
- * @param data Pointer to header character buffer.
- * @param len Length of the buffer.
- * @return Index of body start, or -1 if header end is not found.
  */
 static int find_header_end(const char *data, uint16_t len)
 {
@@ -84,19 +262,20 @@ static int find_header_end(const char *data, uint16_t len)
 
 /**
  * @brief Parses the Content-Length header value from an HTTP request header.
- * @param headers Pointer to the raw HTTP header string.
- * @return Content length in bytes, or 0 if not present.
  */
 static uint32_t parse_content_length(const char *headers)
 {
     const char *p = strstr(headers, "Content-Length:");
     if (p == NULL)
     {
+        p = strstr(headers, "content-length:");
+    }
+    if (p == NULL)
+    {
         return 0;
     }
 
     p += strlen("Content-Length:");
-
     while (*p == ' ')
     {
         p++;
@@ -107,8 +286,6 @@ static uint32_t parse_content_length(const char *headers)
 
 /**
  * @brief Sends an HTTP response string over a TCP connection.
- * @param pcb TCP protocol control block.
- * @param response Null-terminated response string.
  */
 static void send_response(struct tcp_pcb *pcb, const char *response)
 {
@@ -121,7 +298,6 @@ static char s_scd_response[512];
 
 /**
  * @brief Handles GET /api/scd requests and returns active configuration metadata in JSON.
- * @param pcb TCP protocol control block.
  */
 static void handle_get_scd(struct tcp_pcb *pcb)
 {
@@ -149,7 +325,6 @@ static void handle_get_scd(struct tcp_pcb *pcb)
         int json_len = snprintf(s_scd_json_body, sizeof(s_scd_json_body),
                                 "{\"fileName\":\"%s\",\"id\":\"%s\",\"version\":\"%s\"}",
                                 file_name, id, version);
-
         if (json_len < 0)
         {
             json_len = 0;
@@ -194,163 +369,362 @@ static void handle_get_scd(struct tcp_pcb *pcb)
     }
 }
 
-static FIL s_alerts_file;
-static bool s_alerts_file_open = false;
-static char s_alerts_read_buf[256];
-static char s_alerts_header[192];
+static char s_config_json_body[1024];
+static char s_config_response[1280];
 
 /**
- * @brief Streams SD card alert data chunks to a client over TCP.
- * @param pcb TCP protocol control block.
- * @param client Client state pointer.
+ * @brief Handles GET /api/config requests and returns runtime system/IDS settings in JSON.
  */
-static void send_alerts_chunk(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
+static void handle_get_config(struct tcp_pcb *pcb)
 {
-    if (!s_alerts_file_open)
+    SystemConfig_t cfg;
+    SystemConfig_Get(&cfg);
+
+    int body_len = SystemConfig_ToJson(&cfg, s_config_json_body, sizeof(s_config_json_body));
+    if (body_len < 0)
     {
-        if (client != NULL)
-        {
-            client->alerts_active = 0;
-        }
-        api_close_conn(pcb, client);
+        body_len = 0;
+    }
+
+    int resp_len = snprintf(s_config_response, sizeof(s_config_response),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Content-Length: %d\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            "%s",
+                            body_len, s_config_json_body);
+
+    if (resp_len > 0)
+    {
+        send_response(pcb, s_config_response);
+    }
+}
+
+/**
+ * @brief Handles POST /api/config/reset requests and resets settings to factory defaults.
+ */
+static void handle_reset_config(struct tcp_pcb *pcb)
+{
+    SystemConfig_ResetToDefaults();
+    SystemConfig_SaveToSD();
+
+    SystemConfig_t cfg;
+    SystemConfig_Get(&cfg);
+
+    int body_len = SystemConfig_ToJson(&cfg, s_config_json_body, sizeof(s_config_json_body));
+    if (body_len < 0)
+    {
+        body_len = 0;
+    }
+
+    int resp_len = snprintf(s_config_response, sizeof(s_config_response),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Access-Control-Allow-Origin: *\r\n"
+                            "Content-Length: %d\r\n"
+                            "Connection: close\r\n"
+                            "\r\n"
+                            "%s",
+                            body_len, s_config_json_body);
+
+    if (resp_len > 0)
+    {
+        send_response(pcb, s_config_response);
+    }
+}
+
+/**
+ * @brief Handles POST /api/config requests, validates payload, applies settings, and saves to SD.
+ */
+static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t body_len)
+{
+    (void)body_len;
+    SystemConfig_t new_cfg;
+
+    if (!SystemConfig_FromJson(body, &new_cfg))
+    {
+        const char *err_resp =
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 42\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"Invalid configuration parameters\"}";
+        send_response(pcb, err_resp);
         return;
     }
 
-    u16_t snd_avail = tcp_sndbuf(pcb);
-    while (snd_avail >= sizeof(s_alerts_read_buf))
+    if (!SystemConfig_Set(&new_cfg))
     {
-        UINT bytes_read = 0;
-        FRESULT r = f_read(&s_alerts_file, s_alerts_read_buf, sizeof(s_alerts_read_buf), &bytes_read);
-        if (r != FR_OK || bytes_read == 0)
-        {
-            f_close(&s_alerts_file);
-            s_alerts_file_open = false;
-            if (client != NULL)
-            {
-                client->alerts_active = 0;
-            }
-            tcp_output(pcb);
-            api_close_conn(pcb, client);
-            return;
-        }
+        const char *err_resp =
+            "HTTP/1.1 422 Unprocessable Entity\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 39\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"Validation failed on values\"}";
+        send_response(pcb, err_resp);
+        return;
+    }
 
-        err_t write_err = tcp_write(pcb, s_alerts_read_buf, (u16_t)bytes_read, TCP_WRITE_FLAG_COPY);
-        if (write_err != ERR_OK)
+    SystemConfig_SaveToSD();
+
+    int body_size = SystemConfig_ToJson(&new_cfg, s_config_json_body, sizeof(s_config_json_body));
+    if (body_size < 0)
+    {
+        body_size = 0;
+    }
+
+    int total_len = snprintf(s_config_response, sizeof(s_config_response),
+                             "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: application/json\r\n"
+                             "Access-Control-Allow-Origin: *\r\n"
+                             "Content-Length: %d\r\n"
+                             "Connection: close\r\n"
+                             "\r\n"
+                             "%s",
+                             body_size, s_config_json_body);
+
+    if (total_len > 0)
+    {
+        send_response(pcb, s_config_response);
+    }
+}
+
+/**
+ * @brief Streams the alerts response to the HTTP client in TCP-sized chunks.
+ */
+static void stream_alerts_response(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
+{
+    if (client == NULL || pcb == NULL || !client->alerts_active)
+    {
+        return;
+    }
+
+    while (client->resp_sent < client->resp_len)
+    {
+        u16_t avail = tcp_sndbuf(pcb);
+        if (avail == 0)
         {
             break;
         }
 
-        snd_avail = tcp_sndbuf(pcb);
+        u16_t remaining = (u16_t)(client->resp_len - client->resp_sent);
+        u16_t chunk = (remaining > avail) ? avail : remaining;
+        if (chunk > 1460)
+        {
+            chunk = 1460;
+        }
+
+        err_t err = tcp_write(pcb, &client->resp_buf[client->resp_sent], chunk, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK)
+        {
+            break;
+        }
+
+        client->resp_sent += chunk;
     }
 
-    if (snd_avail > 0 && snd_avail < sizeof(s_alerts_read_buf))
+    if (client->resp_sent > 0)
     {
-        UINT bytes_read = 0;
-        FRESULT r = f_read(&s_alerts_file, s_alerts_read_buf, (UINT)snd_avail, &bytes_read);
-        if (r == FR_OK && bytes_read > 0)
-        {
-            tcp_write(pcb, s_alerts_read_buf, (u16_t)bytes_read, TCP_WRITE_FLAG_COPY);
-        }
-        else
-        {
-            f_close(&s_alerts_file);
-            s_alerts_file_open = false;
-            if (client != NULL)
-            {
-                client->alerts_active = 0;
-            }
-            tcp_output(pcb);
-            api_close_conn(pcb, client);
-            return;
-        }
+        tcp_output(pcb);
     }
 
-    tcp_output(pcb);
+    if (client->resp_sent >= client->resp_len)
+    {
+        if (client->alert_buf_idx >= 0)
+        {
+            release_alert_resp_buffer(client->alert_buf_idx);
+            client->alert_buf_idx = -1;
+        }
+        client->alerts_active = 0;
+        api_close_conn(pcb, client);
+    }
 }
 
 /**
- * @brief Handles GET /api/alerts requests and returns recorded security alerts from SD card.
- * @param pcb TCP protocol control block.
- * @param client Client state pointer.
+ * @brief Handles GET /api/alerts (or /api/alerts/history) requests without pagination.
  */
 static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
-    if (s_alerts_file_open)
+    if (client == NULL || pcb == NULL)
     {
-        f_close(&s_alerts_file);
-        s_alerts_file_open = false;
+        api_close_conn(pcb, NULL);
+        return;
     }
 
-    FRESULT res = f_open(&s_alerts_file, SECURITY_ALERTS_FILE, FA_READ);
+    Security_PeriodicFlush();
+
+    uint32_t total = Security_GetAlertCount();
+    uint32_t tot = 0, goose = 0, sv = 0, mms = 0;
+    uint32_t crit = 0, high = 0, warn = 0, info = 0;
+    Security_GetGlobalStats(&tot, &goose, &sv, &mms);
+    Security_GetGlobalSevStats(&crit, &high, &warn, &info);
+
+    int buf_idx = acquire_alert_resp_buffer();
+    if (buf_idx < 0)
+    {
+        const char *busy =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 27\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"Server is busy\"}";
+        send_response(pcb, busy);
+        api_close_conn(pcb, client);
+        return;
+    }
+
+    char *raw_buf = s_alert_resp_buffers[buf_idx];
+
+    if (total == 0)
+    {
+        int body_len = snprintf(raw_buf + 256, 512,
+                                "{\"total\":0,\"total_goose\":0,\"total_sv\":0,\"total_mms\":0,"
+                                "\"total_critical\":0,\"total_high\":0,\"total_warning\":0,\"total_info\":0,"
+                                "\"alerts\":[],\"count\":0}");
+
+        char hdr[256];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+                               "HTTP/1.1 200 OK\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Content-Length: %d\r\n"
+                               "Connection: close\r\n\r\n",
+                               body_len);
+
+        char *full_resp = (raw_buf + 256) - hdr_len;
+        memcpy(full_resp, hdr, hdr_len);
+
+        client->resp_buf = full_resp;
+        client->resp_len = hdr_len + body_len;
+        client->resp_sent = 0;
+        client->alert_buf_idx = buf_idx;
+        client->alerts_active = 1;
+
+        stream_alerts_response(pcb, client);
+        return;
+    }
+
+    if (!Security_LockSD(1000))
+    {
+        release_alert_resp_buffer(buf_idx);
+        const char *busy =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 27\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"Server is busy\"}";
+        send_response(pcb, busy);
+        api_close_conn(pcb, client);
+        return;
+    }
+
+    FIL file;
+    memset(&file, 0, sizeof(file));
+    FRESULT res = f_open(&file, SECURITY_ALERTS_FILE, FA_READ);
     if (res != FR_OK)
     {
-        const char *json_body = "[]";
-        int json_len = (int)strlen(json_body);
-        int resp_len = snprintf(s_alerts_header, sizeof(s_alerts_header),
-                                "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Access-Control-Allow-Origin: *\r\n"
-                                "Content-Length: %d\r\n"
-                                "Connection: close\r\n"
-                                "\r\n"
-                                "%s",
-                                json_len, json_body);
-        if (resp_len > 0)
-        {
-            send_response(pcb, s_alerts_header);
-        }
+        Security_UnlockSD();
+        release_alert_resp_buffer(buf_idx);
+        SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "Alerts file open failed (res=%d)", (int)res);
+        char body[256];
+        int body_len = snprintf(body, sizeof(body),
+                                "{\"total\":%lu,\"total_goose\":%lu,\"total_sv\":%lu,\"total_mms\":%lu,"
+                                "\"total_critical\":%lu,\"total_high\":%lu,\"total_warning\":%lu,\"total_info\":%lu,"
+                                "\"alerts\":[],\"count\":0}",
+                                (unsigned long)total,
+                                (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
+                                (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info);
+
+        char resp[512];
+        (void)snprintf(resp, sizeof(resp),
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: application/json\r\n"
+                       "Access-Control-Allow-Origin: *\r\n"
+                       "Content-Length: %d\r\n"
+                       "Connection: close\r\n\r\n%s",
+                       body_len, body);
+        send_response(pcb, resp);
         api_close_conn(pcb, client);
         return;
     }
 
-    FSIZE_t file_size = f_size(&s_alerts_file);
-    if (file_size == 0)
+    char *body_start = raw_buf + 256;
+    int body_offset = snprintf(body_start, 512,
+                               "{\"total\":%lu,\"total_goose\":%lu,\"total_sv\":%lu,\"total_mms\":%lu,"
+                               "\"total_critical\":%lu,\"total_high\":%lu,\"total_warning\":%lu,\"total_info\":%lu,"
+                               "\"alerts\":[",
+                               (unsigned long)total,
+                               (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
+                               (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info);
+
+    static char temp_line[384];
+    uint32_t records_read = 0;
+    while ((ALERT_RESP_BUF_SIZE - 256 - body_offset) > 400)
     {
-        f_close(&s_alerts_file);
-        const char *json_body = "[]";
-        int json_len = (int)strlen(json_body);
-        int resp_len = snprintf(s_alerts_header, sizeof(s_alerts_header),
-                                "HTTP/1.1 200 OK\r\n"
-                                "Content-Type: application/json\r\n"
-                                "Access-Control-Allow-Origin: *\r\n"
-                                "Content-Length: %d\r\n"
-                                "Connection: close\r\n"
-                                "\r\n"
-                                "%s",
-                                json_len, json_body);
-        if (resp_len > 0)
+        if (f_gets(temp_line, sizeof(temp_line), &file) == NULL)
         {
-            send_response(pcb, s_alerts_header);
+            break;
         }
-        api_close_conn(pcb, client);
-        return;
+
+        size_t slen = strlen(temp_line);
+        while (slen > 0 && (temp_line[slen - 1] == '\r' || temp_line[slen - 1] == '\n'))
+        {
+            temp_line[--slen] = '\0';
+        }
+
+        if (slen == 0)
+        {
+            continue;
+        }
+
+        if (records_read > 0)
+        {
+            body_start[body_offset++] = ',';
+        }
+
+        memcpy(&body_start[body_offset], temp_line, slen);
+        body_offset += (int)slen;
+        records_read++;
     }
 
-    s_alerts_file_open = true;
-    if (client != NULL)
-    {
-        client->alerts_active = 1;
-    }
+    body_offset += snprintf(&body_start[body_offset], 64,
+                            "],\"count\":%lu}", (unsigned long)records_read);
 
-    int header_len = snprintf(s_alerts_header, sizeof(s_alerts_header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: application/json\r\n"
-                              "Access-Control-Allow-Origin: *\r\n"
-                              "Content-Length: %lu\r\n"
-                              "Connection: close\r\n"
-                              "\r\n",
-                              (unsigned long)file_size);
-    if (header_len > 0)
-    {
-        tcp_write(pcb, s_alerts_header, (u16_t)header_len, TCP_WRITE_FLAG_COPY);
-    }
+    f_close(&file);
+    Security_UnlockSD();
 
-    send_alerts_chunk(pcb, client);
+    char hdr[256];
+    int hdr_len = snprintf(hdr, sizeof(hdr),
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: application/json\r\n"
+                           "Access-Control-Allow-Origin: *\r\n"
+                           "Content-Length: %d\r\n"
+                           "Connection: close\r\n\r\n",
+                           body_offset);
+
+    char *full_resp = body_start - hdr_len;
+    memcpy(full_resp, hdr, hdr_len);
+
+    client->resp_buf = full_resp;
+    client->resp_len = hdr_len + body_offset;
+    client->resp_sent = 0;
+    client->alert_buf_idx = buf_idx;
+    client->alerts_active = 1;
+
+    tcp_nagle_disable(pcb);
+    stream_alerts_response(pcb, client);
 }
 
 /**
  * @brief Handles DELETE /api/alerts and POST /api/alerts/clear requests.
- * @param pcb TCP protocol control block.
  */
 static void handle_clear_alerts(struct tcp_pcb *pcb)
 {
@@ -367,22 +741,19 @@ static void handle_clear_alerts(struct tcp_pcb *pcb)
 }
 
 /**
- * @brief Forwards incoming SCD payload chunks to the storage queue.
- * @param client Pointer to the active client connection state.
- * @param data Pointer to chunk data buffer.
- * @param len Length of chunk data in bytes.
+ * @brief Forwards incoming SCD payload chunks to storage with bounded flow control.
  */
-static void process_scd_data(HTTP_API_Client_t *client, const uint8_t *data, uint16_t len)
+static bool process_scd_data(struct tcp_pcb *pcb, HTTP_API_Client_t *client, const uint8_t *data, uint16_t len)
 {
     if (!client->post_active || len == 0)
     {
-        return;
+        return true;
     }
 
     uint32_t remaining = client->content_length - client->body_received;
     if (remaining == 0)
     {
-        return;
+        return true;
     }
 
     if ((uint32_t)len > remaining)
@@ -390,14 +761,39 @@ static void process_scd_data(HTTP_API_Client_t *client, const uint8_t *data, uin
         len = (uint16_t)remaining;
     }
 
-    SCD_Storage_Enqueue(data, len);
+    if (!SCD_Storage_Enqueue(data, len))
+    {
+        SysLog_Print(SYSLOG_LEVEL_ERROR, "HTTP", "SCD Storage enqueue failed, aborting upload");
+        SCD_Storage_Abort();
+        client->post_active = 0;
+        s_scd_upload_active = 0;
+
+        const char *err_resp =
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 26\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"Storage failed\"}";
+        send_response(pcb, err_resp);
+        api_close_conn(pcb, client);
+        return false;
+    }
+
     client->body_received += len;
+    tcp_recved(pcb, len);
+    return true;
 }
 
 /**
- * @brief Finalizes an SCD upload POST request and returns success response.
- * @param pcb TCP protocol control block.
- * @param client Pointer to the active client connection state.
+ * @brief Finalizes an SCD upload POST request.
+ *
+ * IMPORTANT: This function must NOT block the lwIP tcpip thread.
+ * SCD_Storage_End_NoWait() merely enqueues the END event; the storage task
+ * performs the actual file sync and then signals SCD_Config_Task to reload.
+ * We send the HTTP 202 Accepted response immediately and close the connection.
+ * The config reload completes asynchronously on the SCD_ConfigTask.
  */
 static void finish_post(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -407,106 +803,110 @@ static void finish_post(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
     }
 
     client->post_active = 0;
-    SCD_Storage_End();
+    s_scd_upload_active = 0;
+
+    SCD_Storage_End_Async();
+
+    SysLog_Print(SYSLOG_LEVEL_INFO, "HTTP", "SCD upload complete (%lu bytes), reload triggered",
+                 client->body_received);
 
     const char *response =
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.1 202 Accepted\r\n"
         "Content-Type: application/json\r\n"
         "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: 15\r\n"
+        "Content-Length: 34\r\n"
         "Connection: close\r\n"
         "\r\n"
-        "{\"status\":\"ok\"}";
+        "{\"status\":\"ok\",\"reloading\":true}  ";
 
-    printf("[HTTP] POST complete (Upload size: %lu)\n", client->body_received);
     send_response(pcb, response);
     api_close_conn(pcb, client);
 }
 
 /**
- * @brief Removes an SSE client from the active broadcast list.
- * @param client Pointer to the client connection to remove.
+ * @brief Closes a TCP connection cleanly and frees associated client resources.
  */
-static void remove_sse_client(HTTP_API_Client_t *client)
+static void api_close_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
-    if (client != NULL && client->is_sse)
+    if (client != NULL)
     {
-        HTTP_API_Client_t **curr = &sse_clients;
-        while (*curr != NULL)
+        if (client->post_active)
         {
-            if (*curr == client)
-            {
-                *curr = client->next;
-                sse_client_count--;
-                break;
-            }
-            curr = &((*curr)->next);
+            SCD_Storage_Abort();
+            client->post_active = 0;
+            s_scd_upload_active = 0;
         }
-        client->is_sse = 0;
+        remove_sse_client(client);
+        free_client(client);
+    }
+
+    if (pcb != NULL)
+    {
+        tcp_arg(pcb, NULL);
+        tcp_sent(pcb, NULL);
+        tcp_recv(pcb, NULL);
+        tcp_err(pcb, NULL);
+        tcp_poll(pcb, NULL, 0);
+
+        err_t close_err = tcp_close(pcb);
+        if (close_err != ERR_OK)
+        {
+            tcp_abort(pcb);
+        }
     }
 }
 
 /**
- * @brief Closes a TCP connection and frees associated client resources.
- * @param pcb TCP protocol control block.
- * @param client Client state pointer to free.
+ * @brief Aborts a TCP connection immediately (sends RST and frees PCB).
+ *        Must be used when returning ERR_ABRT from callbacks.
  */
-static void api_close_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
+static void api_abort_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
-    remove_sse_client(client);
-
-    if (s_alerts_file_open && client != NULL && client->alerts_active)
-    {
-        f_close(&s_alerts_file);
-        s_alerts_file_open = false;
-        client->alerts_active = 0;
-    }
-
     if (client != NULL)
     {
-        free(client);
+        if (client->post_active)
+        {
+            SCD_Storage_Abort();
+            client->post_active = 0;
+            s_scd_upload_active = 0;
+        }
+        remove_sse_client(client);
+        free_client(client);
     }
-    tcp_arg(pcb, NULL);
-    tcp_sent(pcb, NULL);
-    tcp_recv(pcb, NULL);
-    tcp_err(pcb, NULL);
-    err_t close_err = tcp_close(pcb);
-    if (close_err != ERR_OK)
+
+    if (pcb != NULL)
     {
+        tcp_arg(pcb, NULL);
+        tcp_sent(pcb, NULL);
+        tcp_recv(pcb, NULL);
+        tcp_err(pcb, NULL);
+        tcp_poll(pcb, NULL, 0);
         tcp_abort(pcb);
     }
 }
 
 /**
  * @brief TCP error callback invoked on connection errors.
- * @param arg Pointer to client connection state.
- * @param err Error code.
  */
 static void api_err(void *arg, err_t err)
 {
     HTTP_API_Client_t *client = (HTTP_API_Client_t *)arg;
-    printf("[HTTP] Connection error: %d\n", err);
-    if (s_alerts_file_open)
-    {
-        f_close(&s_alerts_file);
-        s_alerts_file_open = false;
-    }
-
-    remove_sse_client(client);
-
+    SysLog_Print(SYSLOG_LEVEL_DEBUG, "HTTP", "Connection error: %d", err);
     if (client != NULL)
     {
-        free(client);
+        if (client->post_active)
+        {
+            SCD_Storage_Abort();
+            client->post_active = 0;
+            s_scd_upload_active = 0;
+        }
+        remove_sse_client(client);
+        free_client(client);
     }
 }
 
 /**
  * @brief TCP receive callback handling incoming HTTP requests.
- * @param arg Pointer to client connection state.
- * @param pcb TCP protocol control block.
- * @param p Incoming packet buffer.
- * @param err TCP error status.
- * @return ERR_OK on success or error code.
  */
 static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
@@ -520,29 +920,27 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
     if (err != ERR_OK)
     {
-        if (p != NULL)
-        {
-            pbuf_free(p);
-        }
-        return err;
+        pbuf_free(p);
+        api_abort_conn(pcb, client);
+        return ERR_ABRT;
     }
-
-    tcp_recved(pcb, p->tot_len);
 
     if (client == NULL)
     {
-        client = (HTTP_API_Client_t *)malloc(sizeof(HTTP_API_Client_t));
+        client = alloc_client(pcb);
         if (client == NULL)
         {
+            SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "Client pool exhausted (SSE=%u)", sse_client_count);
             pbuf_free(p);
             tcp_abort(pcb);
             return ERR_ABRT;
         }
 
-        memset(client, 0, sizeof(HTTP_API_Client_t));
-        client->pcb = pcb;
         tcp_arg(pcb, client);
+        tcp_poll(pcb, api_poll, 4);
     }
+
+    client->last_activity = HAL_GetTick();
 
     if (!client->header_complete)
     {
@@ -561,20 +959,21 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         int header_end = find_header_end(client->request, client->header_len);
         if (header_end < 0)
         {
+            tcp_recved(pcb, p->tot_len);
             pbuf_free(p);
             return ERR_OK;
         }
 
         client->header_complete = 1;
 
-        if (strncmp(client->request, "OPTIONS /api/scd", 16) == 0 ||
-            strncmp(client->request, "OPTIONS /api/alerts", 19) == 0)
+        if (strncmp(client->request, "OPTIONS ", 8) == 0)
         {
+            tcp_recved(pcb, p->tot_len);
             const char *response =
                 "HTTP/1.1 204 No Content\r\n"
                 "Access-Control-Allow-Origin: *\r\n"
                 "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n"
-                "Access-Control-Allow-Headers: Content-Type, Accept\r\n"
+                "Access-Control-Allow-Headers: Content-Type, Accept, Authorization, X-Requested-With\r\n"
                 "Access-Control-Max-Age: 86400\r\n"
                 "Content-Length: 0\r\n"
                 "Connection: close\r\n"
@@ -588,27 +987,24 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
         if (strncmp(client->request, "GET /api/scd", 12) == 0)
         {
-            printf("[HTTP] Method/Path: GET /api/scd\n");
+            tcp_recved(pcb, p->tot_len);
             handle_get_scd(pcb);
             pbuf_free(p);
             api_close_conn(pcb, client);
             return ERR_OK;
         }
 
-        if (strncmp(client->request, "GET /api/alerts/history", 23) == 0)
+        if (strncmp(client->request, "GET /api/alerts/events", 22) == 0 ||
+            strncmp(client->request, "GET /api/alerts/stream", 22) == 0 ||
+            (strncmp(client->request, "GET /api/alerts", 15) == 0 && strstr(client->request, "text/event-stream") != NULL))
         {
-            printf("[HTTP] Method/Path: GET /api/alerts/history\n");
-            handle_get_alerts(pcb, client);
-            pbuf_free(p);
-            return ERR_OK;
-        }
-
-        if (strncmp(client->request, "GET /api/alerts", 15) == 0)
-        {
-            printf("[HTTP] Method/Path: GET /api/alerts (SSE)\n");
+            tcp_recved(pcb, p->tot_len);
             if (sse_client_count >= MAX_SSE_CLIENTS)
             {
-                const char *resp = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n";
+                const char *resp =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n\r\n";
                 send_response(pcb, resp);
                 pbuf_free(p);
                 api_close_conn(pcb, client);
@@ -616,7 +1012,7 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             }
 
             client->is_sse = 1;
-            client->next = sse_clients;
+            client->next_sse = sse_clients;
             sse_clients = client;
             sse_client_count++;
 
@@ -635,31 +1031,117 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             return ERR_OK;
         }
 
+        if (strncmp(client->request, "GET /api/alerts", 15) == 0 ||
+            strncmp(client->request, "GET /api/alerts/history", 23) == 0)
+        {
+            tcp_recved(pcb, p->tot_len);
+            handle_get_alerts(pcb, client);
+            pbuf_free(p);
+            return ERR_OK;
+        }
+
         if (strncmp(client->request, "DELETE /api/alerts", 18) == 0 ||
             strncmp(client->request, "POST /api/alerts/clear", 22) == 0)
         {
-            printf("[HTTP] Method/Path: DELETE /api/alerts\n");
+            tcp_recved(pcb, p->tot_len);
+            SysLog_Print(SYSLOG_LEVEL_INFO, "SEC", "Alert history cleared via HTTP API");
             handle_clear_alerts(pcb);
             pbuf_free(p);
             api_close_conn(pcb, client);
             return ERR_OK;
         }
 
+        if (strncmp(client->request, "GET /api/config", 15) == 0)
+        {
+            tcp_recved(pcb, p->tot_len);
+            handle_get_config(pcb);
+            pbuf_free(p);
+            api_close_conn(pcb, client);
+            return ERR_OK;
+        }
+
+        if (strncmp(client->request, "POST /api/config/reset", 22) == 0)
+        {
+            tcp_recved(pcb, p->tot_len);
+            SysLog_Print(SYSLOG_LEVEL_INFO, "CONFIG", "Configuration reset to factory defaults");
+            handle_reset_config(pcb);
+            pbuf_free(p);
+            api_close_conn(pcb, client);
+            return ERR_OK;
+        }
+
+        if (strncmp(client->request, "POST /api/config", 16) == 0)
+        {
+            client->content_length = parse_content_length(client->request);
+            uint16_t body_offset = (uint16_t)header_end;
+            uint16_t body_available = 0;
+            if (client->header_len > body_offset)
+            {
+                body_available = client->header_len - body_offset;
+            }
+
+            SysLog_Print(SYSLOG_LEVEL_INFO, "CONFIG", "POST /api/config received (Length: %lu)",
+                         (unsigned long)client->content_length);
+
+            if (body_available >= client->content_length)
+            {
+                tcp_recved(pcb, p->tot_len);
+                client->request[body_offset + client->content_length] = '\0';
+                handle_post_config(pcb, client->request + body_offset, (uint16_t)client->content_length);
+                pbuf_free(p);
+                api_close_conn(pcb, client);
+                return ERR_OK;
+            }
+            else
+            {
+                client->post_config_active = 1;
+                client->body_received = body_available;
+                tcp_recved(pcb, p->tot_len);
+                pbuf_free(p);
+                return ERR_OK;
+            }
+        }
+
         if (strncmp(client->request, "POST /api/scd", 13) == 0)
         {
+            if (s_scd_upload_active)
+            {
+                SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "POST /api/scd rejected: upload already in progress");
+                tcp_recved(pcb, p->tot_len);
+                const char *busy_resp =
+                    "HTTP/1.1 503 Service Unavailable\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Content-Length: 30\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "{\"error\":\"Upload in progress\"}";
+                send_response(pcb, busy_resp);
+                pbuf_free(p);
+                api_close_conn(pcb, client);
+                return ERR_OK;
+            }
+
+            s_scd_upload_active = 1;
             client->content_length = parse_content_length(client->request);
             client->body_received = 0;
             client->post_active = 1;
 
-            printf("[HTTP] Method/Path: POST /api/scd (Length: %lu)\n", client->content_length);
+            SysLog_Print(SYSLOG_LEVEL_INFO, "HTTP", "POST /api/scd started (Length: %lu)", client->content_length);
 
             SCD_Storage_Start();
 
             uint16_t body_offset = (uint16_t)header_end;
+            tcp_recved(pcb, body_offset);
+
             if (client->header_len > body_offset)
             {
                 uint16_t body_len = client->header_len - body_offset;
-                process_scd_data(client, (const uint8_t *)client->request + body_offset, body_len);
+                if (!process_scd_data(pcb, client, (const uint8_t *)client->request + body_offset, body_len))
+                {
+                    pbuf_free(p);
+                    return ERR_OK;
+                }
             }
 
             if (client->body_received >= client->content_length)
@@ -671,8 +1153,10 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             return ERR_OK;
         }
 
+        tcp_recved(pcb, p->tot_len);
         const char *response =
             "HTTP/1.1 404 Not Found\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
             "Content-Length: 0\r\n"
             "Connection: close\r\n"
             "\r\n";
@@ -685,27 +1169,66 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
     if (client->post_active)
     {
-        uint16_t len = p->tot_len;
-        static uint8_t temp[SCD_CHUNK_SIZE];
+        uint16_t total_len = p->tot_len;
         uint16_t processed = 0;
 
-        while (processed < len)
+        while (processed < total_len)
         {
-            uint16_t copy_len = len - processed;
+            uint8_t temp[BODY_CHUNK_SIZE];
+            uint16_t copy_len = total_len - processed;
             if (copy_len > sizeof(temp))
             {
                 copy_len = sizeof(temp);
             }
 
             pbuf_copy_partial(p, temp, copy_len, processed);
-            process_scd_data(client, temp, copy_len);
+            if (!process_scd_data(pcb, client, temp, copy_len))
+            {
+                pbuf_free(p);
+                return ERR_OK;
+            }
             processed += copy_len;
         }
 
         if (client->body_received >= client->content_length)
         {
             finish_post(pcb, client);
+            pbuf_free(p);
+            return ERR_OK;
         }
+    }
+    else if (client->post_config_active)
+    {
+        uint16_t total_len = p->tot_len;
+        int header_end = find_header_end(client->request, client->header_len);
+        uint16_t body_offset = (header_end > 0) ? (uint16_t)header_end : 0;
+        uint16_t space_remaining = 0;
+        if ((body_offset + client->body_received) < (HTTP_API_REQUEST_BUFFER_SIZE - 1))
+        {
+            space_remaining = (HTTP_API_REQUEST_BUFFER_SIZE - 1) - (body_offset + client->body_received);
+        }
+        uint16_t copy_len = (total_len < space_remaining) ? total_len : space_remaining;
+
+        pbuf_copy_partial(p, client->request + body_offset + client->body_received, copy_len, 0);
+        client->body_received += copy_len;
+        tcp_recved(pcb, total_len);
+
+        if (client->body_received >= client->content_length)
+        {
+            client->request[body_offset + client->content_length] = '\0';
+            handle_post_config(pcb, client->request + body_offset, (uint16_t)client->content_length);
+            client->post_config_active = 0;
+            pbuf_free(p);
+            api_close_conn(pcb, client);
+            return ERR_OK;
+        }
+
+        pbuf_free(p);
+        return ERR_OK;
+    }
+    else
+    {
+        tcp_recved(pcb, p->tot_len);
     }
 
     pbuf_free(p);
@@ -714,34 +1237,54 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
 /**
  * @brief TCP accept callback for incoming client connections on the API port.
- * @param arg User supplied argument.
- * @param newpcb New TCP protocol control block for the connected client.
- * @param err TCP connection error status.
- * @return ERR_OK on success or error code.
  */
 static err_t api_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     (void)arg;
 
-    if (err != ERR_OK)
+    if (err != ERR_OK || newpcb == NULL)
     {
-        return err;
+        return ERR_VAL;
     }
 
-    printf("[HTTP] New connection accepted\n");
-    tcp_arg(newpcb, NULL);
+    HTTP_API_Client_t *client = alloc_client(newpcb);
+    if (client == NULL)
+    {
+        SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "Client pool exhausted on accept (SSE=%u)", sse_client_count);
+        return ERR_MEM;
+    }
+
+    tcp_arg(newpcb, client);
     tcp_recv(newpcb, api_recv);
     tcp_sent(newpcb, api_sent);
     tcp_err(newpcb, api_err);
+    tcp_poll(newpcb, api_poll, 4);
+    tcp_nagle_disable(newpcb);
 
     return ERR_OK;
 }
+
+static uint8_t s_http_initialized = 0;
 
 /**
  * @brief Initializes and starts the HTTP REST API server on port 8080.
  */
 void HTTP_API_Init(void)
 {
+    if (api_pcb != NULL)
+    {
+        return;
+    }
+
+    memset(s_clients, 0, sizeof(s_clients));
+    memset(s_alert_pool, 0, sizeof(s_alert_pool));
+    s_scd_upload_active = 0;
+
+    if (s_alert_pool_mutex == NULL)
+    {
+        s_alert_pool_mutex = osMutexCreate(osMutex(AlertPoolMutex));
+    }
+
     api_pcb = tcp_new();
     if (api_pcb == NULL)
     {
@@ -758,23 +1301,42 @@ void HTTP_API_Init(void)
     api_pcb = tcp_listen(api_pcb);
     if (api_pcb == NULL)
     {
-        printf("[HTTP] Failed to listen on port %d\n", HTTP_API_PORT);
+        SysLog_Print(SYSLOG_LEVEL_ERROR, "HTTP", "Failed to listen on port %d", HTTP_API_PORT);
         return;
     }
 
     tcp_accept(api_pcb, api_accept);
-    printf("[HTTP] Server listening on port %d\n", HTTP_API_PORT);
+    s_http_initialized = 1;
+    SysLog_Print(SYSLOG_LEVEL_INFO, "HTTP", "Server listening on port %d", HTTP_API_PORT);
 }
 
-typedef struct
+/**
+ * @brief Returns 1 if the HTTP server listening PCB is active, 0 otherwise.
+ */
+uint8_t HTTP_API_IsListening(void)
 {
-    char data[512];
-    uint16_t len;
-} SSE_Message_t;
+    return (api_pcb != NULL && api_pcb->state == LISTEN);
+}
+
+/**
+ * @brief Verifies that the HTTP server is listening, re-initializing if needed.
+ */
+void HTTP_API_EnsureListening(void)
+{
+    if (!s_http_initialized)
+    {
+        return;
+    }
+
+    if (!HTTP_API_IsListening())
+    {
+        SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "Server not listening! Re-initializing port %d...", HTTP_API_PORT);
+        HTTP_API_Init();
+    }
+}
 
 /**
  * @brief Broadcasts an SSE alert payload to all connected SSE clients.
- * @param ctx Pointer to an SSE_Message_t heap-allocated message (freed on completion).
  */
 static void do_broadcast_alert(void *ctx)
 {
@@ -792,25 +1354,42 @@ static void do_broadcast_alert(void *ctx)
         HTTP_API_Client_t *curr = sse_clients;
         while (curr != NULL)
         {
+            HTTP_API_Client_t *next = curr->next_sse;
             if (curr->is_sse && curr->pcb != NULL)
             {
                 err_t err = tcp_write(curr->pcb, sse_payload, (u16_t)sse_len, TCP_WRITE_FLAG_COPY);
                 if (err == ERR_OK)
                 {
                     tcp_output(curr->pcb);
+                    curr->last_activity = HAL_GetTick();
+                }
+                else if (err == ERR_MEM)
+                {
+                }
+                else
+                {
+                    SysLog_Print(SYSLOG_LEVEL_DEBUG, "HTTP", "SSE broadcast failed (%d), dropping client", err);
+                    api_close_conn(curr->pcb, curr);
                 }
             }
-            curr = curr->next;
+            curr = next;
         }
     }
 
-    free(msg);
+    if (s_alert_pool_mutex != NULL)
+    {
+        osMutexWait(s_alert_pool_mutex, osWaitForever);
+        msg->in_use = 0;
+        osMutexRelease(s_alert_pool_mutex);
+    }
+    else
+    {
+        msg->in_use = 0;
+    }
 }
 
 /**
  * @brief Enqueues an alert JSON line for broadcast to all connected SSE clients.
- * @param json_line Null-terminated JSON line string.
- * @param len Length of json_line in bytes.
  */
 void HTTP_API_BroadcastAlert(const char *json_line, uint16_t len)
 {
@@ -819,9 +1398,34 @@ void HTTP_API_BroadcastAlert(const char *json_line, uint16_t len)
         return;
     }
 
-    SSE_Message_t *msg = (SSE_Message_t *)malloc(sizeof(SSE_Message_t));
+    if (s_alert_pool_mutex == NULL)
+    {
+        s_alert_pool_mutex = osMutexCreate(osMutex(AlertPoolMutex));
+        if (s_alert_pool_mutex == NULL)
+        {
+            return;
+        }
+    }
+
+    if (osMutexWait(s_alert_pool_mutex, 100) != osOK)
+    {
+        return;
+    }
+
+    SSE_Message_t *msg = NULL;
+    for (int i = 0; i < MAX_ALERT_POOL; i++)
+    {
+        if (!s_alert_pool[i].in_use)
+        {
+            msg = &s_alert_pool[i];
+            msg->in_use = 1;
+            break;
+        }
+    }
+
     if (msg == NULL)
     {
+        osMutexRelease(s_alert_pool_mutex);
         return;
     }
 
@@ -840,8 +1444,19 @@ void HTTP_API_BroadcastAlert(const char *json_line, uint16_t len)
 
     msg->len = (uint16_t)strlen(msg->data);
 
+    osMutexRelease(s_alert_pool_mutex);
+
     if (tcpip_callback(do_broadcast_alert, msg) != ERR_OK)
     {
-        free(msg);
+        if (s_alert_pool_mutex != NULL)
+        {
+            osMutexWait(s_alert_pool_mutex, osWaitForever);
+            msg->in_use = 0;
+            osMutexRelease(s_alert_pool_mutex);
+        }
+        else
+        {
+            msg->in_use = 0;
+        }
     }
 }
