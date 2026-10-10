@@ -64,7 +64,7 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 7 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)256)
-#define configTOTAL_HEAP_SIZE                    ((size_t)131072)
+#define configTOTAL_HEAP_SIZE                    ((size_t)196608)
 #define configMAX_TASK_NAME_LEN                  ( 16 )
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
@@ -134,6 +134,13 @@ standard names. */
 
 /* USER CODE BEGIN Defines */
 /* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+#define configUSE_COUNTING_SEMAPHORES            1
+/* Stack overflow detection: method 2 fills the stack with a pattern and checks the watermark */
+#define configCHECK_FOR_STACK_OVERFLOW          2
+/* Allow uxTaskGetStackHighWaterMark() to be used for diagnostics */
+#define INCLUDE_uxTaskGetStackHighWaterMark     1
+/* Enable task listing and runtime stats */
+#define configUSE_TRACE_FACILITY                1
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

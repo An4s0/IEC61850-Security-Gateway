@@ -32,6 +32,10 @@
 #include "http_api.h"
 #include "scd_storage.h"
 #include "scd_config.h"
+#include "security.h"
+#include "sdmmc.h"
+#include "system_config.h"
+#include "system_logger.h"
 #include "lwip/tcpip.h"
 
 /* USER CODE END Includes */
@@ -53,7 +57,7 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-SPI_HandleTypeDef hspi6;
+SD_HandleTypeDef hsd1;
 
 UART_HandleTypeDef huart3;
 
@@ -69,6 +73,8 @@ osMessageQId SCD_ConfigQueueHandle;
 osMessageQId SVQueueHandle;
 osMessageQId MMSQueueHandle;
 /* USER CODE BEGIN PV */
+extern struct netif gnetif;
+extern ETH_HandleTypeDef heth;
 
 /* USER CODE END PV */
 
@@ -77,7 +83,7 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART3_UART_Init(void);
-static void MX_SPI6_Init(void);
+void MX_SDMMC1_SD_Init(void);
 void StartDefaultTask(void const *argument);
 void StartGooseTask(void const *argument);
 void StartSCD_StorageTask(void const *argument);
@@ -102,7 +108,8 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /* Enable Cortex-M7 Instruction Cache for full 216 MHz Flash execution */
+  SCB_EnableICache();
   /* USER CODE END 1 */
 
   /* MPU Configuration--------------------------------------------------------*/
@@ -127,8 +134,8 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART3_UART_Init();
-  MX_SPI6_Init();
   MX_FATFS_Init();
+  MX_SDMMC1_SD_Init();
   /* USER CODE BEGIN 2 */
   f_mount(&USERFatFS, USERPath, 0);
   /* USER CODE END 2 */
@@ -159,7 +166,7 @@ int main(void)
   SCD_ConfigQueueHandle = osMessageCreate(osMessageQ(SCD_ConfigQueue), NULL);
 
   /* definition and creation of SVQueue */
-  osMessageQDef(SVQueue, 16, uint32_t);
+  osMessageQDef(SVQueue, 32, uint32_t);
   SVQueueHandle = osMessageCreate(osMessageQ(SVQueue), NULL);
 
   /* definition and creation of MMSQueue */
@@ -180,19 +187,19 @@ int main(void)
   GooseTaskHandle = osThreadCreate(osThread(GooseTask), NULL);
 
   /* definition and creation of SCD_StorageTask */
-  osThreadDef(SCD_StorageTask, StartSCD_StorageTask, osPriorityAboveNormal, 0, 512);
+  osThreadDef(SCD_StorageTask, StartSCD_StorageTask, osPriorityAboveNormal, 0, 1024);
   SCD_StorageTaskHandle = osThreadCreate(osThread(SCD_StorageTask), NULL);
 
   /* definition and creation of SCD_ConfigTask */
-  osThreadDef(SCD_ConfigTask, StartSCD_ConfigTask, osPriorityIdle, 0, 2048);
+  osThreadDef(SCD_ConfigTask, StartSCD_ConfigTask, osPriorityNormal, 0, 2048);
   SCD_ConfigTaskHandle = osThreadCreate(osThread(SCD_ConfigTask), NULL);
 
   /* definition and creation of SVTask */
-  osThreadDef(SVTask, StartSVTask, osPriorityHigh, 0, 1024);
+  osThreadDef(SVTask, StartSVTask, osPriorityHigh, 0, 2048);
   SVTaskHandle = osThreadCreate(osThread(SVTask), NULL);
 
   /* definition and creation of MMSTask */
-  osThreadDef(MMSTask, StartMMSTask, osPriorityHigh, 0, 1024);
+  osThreadDef(MMSTask, StartMMSTask, osPriorityHigh, 0, 2048);
   MMSTaskHandle = osThreadCreate(osThread(MMSTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
@@ -241,7 +248,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLM = 4;
   RCC_OscInitStruct.PLL.PLLN = 216;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 9;
   RCC_OscInitStruct.PLL.PLLR = 2;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
@@ -270,42 +277,25 @@ void SystemClock_Config(void)
 }
 
 /**
- * @brief SPI6 Initialization Function
+ * @brief SDMMC1 Initialization Function
  * @param None
  * @retval None
  */
-static void MX_SPI6_Init(void)
+void MX_SDMMC1_SD_Init(void)
 {
 
-  /* USER CODE BEGIN SPI6_Init 0 */
+  /* USER CODE BEGIN SDMMC1_Init 0 */
 
-  /* USER CODE END SPI6_Init 0 */
+  /* USER CODE END SDMMC1_Init 0 */
 
-  /* USER CODE BEGIN SPI6_Init 1 */
+  /* USER CODE BEGIN SDMMC1_Init 1 */
 
-  /* USER CODE END SPI6_Init 1 */
-  /* SPI6 parameter configuration*/
-  hspi6.Instance = SPI6;
-  hspi6.Init.Mode = SPI_MODE_MASTER;
-  hspi6.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi6.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi6.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi6.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi6.Init.NSS = SPI_NSS_SOFT;
-  hspi6.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
-  hspi6.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi6.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi6.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi6.Init.CRCPolynomial = 7;
-  hspi6.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi6.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
-  if (HAL_SPI_Init(&hspi6) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI6_Init 2 */
+  /* USER CODE END SDMMC1_Init 1 */
+  /* Initialize SDMMC1 GPIOs and peripheral power cleanly using register-level driver */
+  SDMMC_GPIO_Init();
+  /* USER CODE BEGIN SDMMC1_Init 2 */
 
-  /* USER CODE END SPI6_Init 2 */
+  /* USER CODE END SDMMC1_Init 2 */
 }
 
 /**
@@ -362,15 +352,11 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(SPI6_CS_GPIO_Port, SPI6_CS_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin : SPI6_CS_Pin */
-  GPIO_InitStruct.Pin = SPI6_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  /*Configure GPIO pin : PG2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(SPI6_CS_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -382,6 +368,17 @@ int __io_putchar(int ch)
 {
   HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;
+}
+
+int _write(int file, char *ptr, int len)
+{
+  (void)file;
+  if (ptr == NULL || len <= 0)
+  {
+    return 0;
+  }
+  HAL_UART_Transmit(&huart3, (uint8_t *)ptr, (uint16_t)len, 100);
+  return len;
 }
 
 /* USER CODE END 4 */
@@ -398,9 +395,13 @@ void StartDefaultTask(void const *argument)
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
-  printf("STM32 STARTED!\n");
+  SysLog_Init();
+  SysLog_Print(SYSLOG_LEVEL_INFO, "BOOT", "IEC 61850 Security Gateway started. STM32F767ZI.");
+  SystemConfig_Init();
   SCD_Storage_Init();
   SCD_Config_Init();
+  Security_Init();
+  Security_SyncAlertCounter();
 
   LOCK_TCPIP_CORE();
   HTTP_API_Init();
@@ -408,10 +409,13 @@ void StartDefaultTask(void const *argument)
   UNLOCK_TCPIP_CORE();
 
   SCD_Config_RequestLoadStartup();
-  /* Infinite loop */
+  SysLog_Print(SYSLOG_LEVEL_INFO, "SYS", "HTTP server listening on port %d", HTTP_API_PORT);
+
   for (;;)
   {
-    osDelay(1);
+    osDelay(100);
+    Security_PeriodicFlush();
+    SysLog_PeriodicFlush();
   }
   /* USER CODE END 5 */
 }

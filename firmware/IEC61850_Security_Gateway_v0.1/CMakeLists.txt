@@ -53,7 +53,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/http_api.c
     Core/Src/scd_storage.c
     Core/Src/scd_config.c
-    FATFS/Target/user_diskio_spi.c
+    Core/Src/sdmmc.c
+    Core/Src/system_config.c
+    Core/Src/system_logger.c
 )
 
 # Add include paths

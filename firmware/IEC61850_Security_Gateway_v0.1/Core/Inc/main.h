@@ -53,15 +53,13 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+extern SD_HandleTypeDef hsd1;
+void MX_SDMMC1_SD_Init(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define SPI6_CS_Pin GPIO_PIN_3
-#define SPI6_CS_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
-#define SD_SPI_HANDLE hspi6
 
 /* USER CODE END Private defines */
 

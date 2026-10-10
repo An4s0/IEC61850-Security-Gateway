@@ -20,7 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 /* USER CODE BEGIN Includes */
-
+#include "sdmmc.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -79,79 +79,60 @@ void HAL_MspInit(void)
 }
 
 /**
-  * @brief SPI MSP Initialization
+  * @brief SD MSP Initialization
   * This function configures the hardware resources used in this example
-  * @param hspi: SPI handle pointer
+  * @param hsd: SD handle pointer
   * @retval None
   */
-void HAL_SPI_MspInit(SPI_HandleTypeDef* hspi)
+void HAL_SD_MspInit(SD_HandleTypeDef* hsd)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  if(hspi->Instance==SPI6)
+  if(hsd->Instance==SDMMC1)
   {
-    /* USER CODE BEGIN SPI6_MspInit 0 */
+    /* USER CODE BEGIN SDMMC1_MspInit 0 */
 
-    /* USER CODE END SPI6_MspInit 0 */
-    /* Peripheral clock enable */
-    __HAL_RCC_SPI6_CLK_ENABLE();
+    /* USER CODE END SDMMC1_MspInit 0 */
 
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    __HAL_RCC_GPIOG_CLK_ENABLE();
-    /**SPI6 GPIO Configuration
-    PA5     ------> SPI6_SCK
-    PA6     ------> SPI6_MISO
-    PG14     ------> SPI6_MOSI
-    */
-    GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF8_SPI6;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    /* Initialize SDMMC1 GPIOs and peripheral power cleanly using register-level driver */
+    SDMMC_GPIO_Init();
 
-    GPIO_InitStruct.Pin = GPIO_PIN_14;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF5_SPI6;
-    HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+    /* USER CODE BEGIN SDMMC1_MspInit 1 */
 
-    /* USER CODE BEGIN SPI6_MspInit 1 */
-
-    /* USER CODE END SPI6_MspInit 1 */
-
+    /* USER CODE END SDMMC1_MspInit 1 */
   }
-
 }
 
 /**
-  * @brief SPI MSP De-Initialization
+  * @brief SD MSP De-Initialization
   * This function freeze the hardware resources used in this example
-  * @param hspi: SPI handle pointer
+  * @param hsd: SD handle pointer
   * @retval None
   */
-void HAL_SPI_MspDeInit(SPI_HandleTypeDef* hspi)
+void HAL_SD_MspDeInit(SD_HandleTypeDef* hsd)
 {
-  if(hspi->Instance==SPI6)
+  if(hsd->Instance==SDMMC1)
   {
-    /* USER CODE BEGIN SPI6_MspDeInit 0 */
+    /* USER CODE BEGIN SDMMC1_MspDeInit 0 */
 
-    /* USER CODE END SPI6_MspDeInit 0 */
+    /* USER CODE END SDMMC1_MspDeInit 0 */
     /* Peripheral clock disable */
-    __HAL_RCC_SPI6_CLK_DISABLE();
+    __HAL_RCC_SDMMC1_CLK_DISABLE();
 
-    /**SPI6 GPIO Configuration
-    PA5     ------> SPI6_SCK
-    PA6     ------> SPI6_MISO
-    PG14     ------> SPI6_MOSI
+    /**SDMMC1 GPIO Configuration
+    PC8     ------> SDMMC1_D0
+    PC9     ------> SDMMC1_D1
+    PC10     ------> SDMMC1_D2
+    PC11     ------> SDMMC1_D3
+    PC12     ------> SDMMC1_CK
+    PD2     ------> SDMMC1_CMD
     */
-    HAL_GPIO_DeInit(GPIOA, GPIO_PIN_5|GPIO_PIN_6);
+    HAL_GPIO_DeInit(GPIOC, GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11
+                          |GPIO_PIN_12);
 
-    HAL_GPIO_DeInit(GPIOG, GPIO_PIN_14);
+    HAL_GPIO_DeInit(GPIOD, GPIO_PIN_2);
 
-    /* USER CODE BEGIN SPI6_MspDeInit 1 */
+    /* USER CODE BEGIN SDMMC1_MspDeInit 1 */
 
-    /* USER CODE END SPI6_MspDeInit 1 */
+    /* USER CODE END SDMMC1_MspDeInit 1 */
   }
 
 }
