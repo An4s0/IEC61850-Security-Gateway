@@ -8,7 +8,7 @@
 #include <stdbool.h>
 
 #define SV_MAX_FRAME_SIZE 512
-#define SV_FRAME_POOL_SIZE 16
+#define SV_FRAME_POOL_SIZE 32
 
 typedef struct
 {
@@ -58,9 +58,20 @@ typedef struct
     char details[128];
 } SV_Event_t;
 
+typedef struct
+{
+    uint32_t frames_received;
+    uint32_t frames_processed;
+    uint32_t pool_alloc_failures;
+    uint32_t queue_sends_failed;
+    uint32_t pool_peak_usage;
+    uint32_t queue_high_water;
+} Sv_Stats_t;
+
 void Sv_Init(void);
 void Sv_Enqueue(struct pbuf *p);
 void Sv_Task(void const *argument);
+void Sv_GetStats(Sv_Stats_t *stats);
 
 SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame);
 const char *Sv_EventToString(SV_EventType_t type);

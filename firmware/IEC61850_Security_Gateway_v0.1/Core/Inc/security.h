@@ -3,8 +3,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "ff.h"
 
-#define SECURITY_ALERTS_FILE "0:/alerts.json"
+#define SECURITY_ALERTS_FILE "0:/alerts/alerts.ndjson"
 
 typedef enum
 {
@@ -42,11 +43,29 @@ typedef struct
     const char *recommendation;
 } Security_AlertLog_t;
 
+typedef struct
+{
+    uint32_t alerts_generated;
+    uint32_t alerts_written;
+    uint32_t alerts_dropped;
+    uint32_t storage_errors;
+    uint32_t slots_in_use;
+    uint32_t slots_high_water;
+} Security_Stats_t;
+
 void Security_Init(void);
+void Security_SyncAlertCounter(void);
 const char *Security_SeverityToString(Security_Severity_t sev);
 const char *Security_ProtocolToString(Security_Protocol_t proto);
 bool Security_LogAlertToSD(const Security_AlertLog_t *alert);
+void Security_PeriodicFlush(void);
 bool Security_ClearAlertsOnSD(void);
 uint32_t Security_GetAlertCount(void);
+void Security_GetStats(Security_Stats_t *stats);
+
+bool Security_LockSD(uint32_t timeout_ms);
+void Security_UnlockSD(void);
+void Security_GetGlobalStats(uint32_t *total, uint32_t *goose, uint32_t *sv, uint32_t *mms);
+void Security_GetGlobalSevStats(uint32_t *crit, uint32_t *high, uint32_t *warn, uint32_t *info);
 
 #endif /* SECURITY_H */

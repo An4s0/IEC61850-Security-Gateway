@@ -1,5 +1,7 @@
 #include "mms.h"
 #include "main.h"
+#include "system_config.h"
+#include "system_logger.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
@@ -192,6 +194,11 @@ static bool parse_mms_frame(const uint8_t *data, uint16_t len, uint32_t now_ms, 
     return true;
 }
 
+static MMS_Event_t s_mms_event;
+static char s_mms_target_str[128];
+static uint32_t s_last_mms_print_tick = 0;
+static uint32_t s_mms_suppressed_prints = 0;
+
 /**
  * @brief Emits an MMS security event and logs anomalies to SD card.
  * @param e Pointer to security event structure.
@@ -205,31 +212,58 @@ static void emit_mms_event(const MMS_Event_t *e)
 
     if (e->type != MMS_EVENT_ACCEPT)
     {
-        printf("[IDS] MMS Event: %s | Sev: %s | Src: %s -> Dst: %s:%u | Details: %s\n",
-               Mms_EventToString(e->type),
-               Security_SeverityToString(e->severity),
-               e->src_ip, e->dst_ip, (unsigned int)e->dst_port,
-               e->details);
+        SystemConfig_t sys_cfg;
+        SystemConfig_Get(&sys_cfg);
+        uint32_t interval = sys_cfg.alerts.anomaly_print_interval_ms ? sys_cfg.alerts.anomaly_print_interval_ms : 1000;
+        uint32_t now = HAL_GetTick();
+        bool print_to_console = (e->type != MMS_EVENT_UNEXPECTED_ENDPOINT &&
+                                 e->type != MMS_EVENT_UNAUTHORIZED_WRITE &&
+                                 e->type != MMS_EVENT_UNKNOWN_DESTINATION);
+        if (print_to_console)
+        {
+            if ((now - s_last_mms_print_tick) >= interval)
+            {
+                if (s_mms_suppressed_prints > 0)
+                {
+                    SysLog_Print(SYSLOG_LEVEL_DEBUG, "IDS", "MMS: %lu anomaly events suppressed in last %lu ms",
+                                 (unsigned long)s_mms_suppressed_prints, (unsigned long)(now - s_last_mms_print_tick));
+                    s_mms_suppressed_prints = 0;
+                }
+                s_last_mms_print_tick = now;
 
-        char target_str[128] = {0};
+                if (e->severity >= SEC_SEV_HIGH)
+                {
+                    printf("[IDS] %s | %s | %s -> %s:%u\r\n",
+                           Mms_EventToString(e->type),
+                           Security_SeverityToString(e->severity),
+                           e->src_ip, e->dst_ip, (unsigned int)e->dst_port);
+                }
+            }
+            else
+            {
+                s_mms_suppressed_prints++;
+            }
+        }
+
+        s_mms_target_str[0] = '\0';
         if (e->ied[0] != '\0')
         {
             if (e->ap[0] != '\0')
             {
-                snprintf(target_str, sizeof(target_str), "%s/%s", e->ied, e->ap);
+                snprintf(s_mms_target_str, sizeof(s_mms_target_str), "%s/%s", e->ied, e->ap);
             }
             else
             {
-                snprintf(target_str, sizeof(target_str), "%s", e->ied);
+                snprintf(s_mms_target_str, sizeof(s_mms_target_str), "%s", e->ied);
             }
         }
         else
         {
-            snprintf(target_str, sizeof(target_str), "%s:%u", e->dst_ip, (unsigned int)e->dst_port);
+            snprintf(s_mms_target_str, sizeof(s_mms_target_str), "%s:%u", e->dst_ip, (unsigned int)e->dst_port);
         }
 
         Security_AlertLog_t alert = {
-            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : HAL_GetTick(),
+            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : now,
             .frame_timestamp_ms = e->frame_timestamp_ms,
             .protocol = SEC_PROTO_MMS,
             .severity = e->severity,
@@ -238,13 +272,54 @@ static void emit_mms_event(const MMS_Event_t *e)
             .dst_mac = NULL,
             .src_ip = e->src_ip,
             .dst_ip = e->dst_ip,
-            .target = target_str[0] ? target_str : NULL,
+            .target = s_mms_target_str[0] ? s_mms_target_str : NULL,
             .app_id = e->dst_port,
             .vlan_id = 0,
             .conf_rev = 1,
             .st_num = 0,
             .sq_num = 0,
             .details = e->details,
+            .recommendation = NULL};
+
+        Security_LogAlertToSD(&alert);
+    }
+    else
+    {
+        uint32_t now = HAL_GetTick();
+        s_mms_target_str[0] = '\0';
+        if (e->ied[0] != '\0')
+        {
+            if (e->ap[0] != '\0')
+            {
+                snprintf(s_mms_target_str, sizeof(s_mms_target_str), "%s/%s", e->ied, e->ap);
+            }
+            else
+            {
+                snprintf(s_mms_target_str, sizeof(s_mms_target_str), "%s", e->ied);
+            }
+        }
+        else
+        {
+            snprintf(s_mms_target_str, sizeof(s_mms_target_str), "%s:%u", e->dst_ip, (unsigned int)e->dst_port);
+        }
+
+        Security_AlertLog_t alert = {
+            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : now,
+            .frame_timestamp_ms = e->frame_timestamp_ms,
+            .protocol = SEC_PROTO_MMS,
+            .severity = SEC_SEV_INFO,
+            .event_type = Mms_EventToString(e->type),
+            .src_mac = NULL,
+            .dst_mac = NULL,
+            .src_ip = e->src_ip,
+            .dst_ip = e->dst_ip,
+            .target = s_mms_target_str[0] ? s_mms_target_str : NULL,
+            .app_id = e->dst_port,
+            .vlan_id = 0,
+            .conf_rev = 1,
+            .st_num = 0,
+            .sq_num = 0,
+            .details = "Normal MMS connection validated against active SCD baseline",
             .recommendation = NULL};
 
         Security_LogAlertToSD(&alert);
@@ -301,13 +376,12 @@ MMS_EventType_t Mms_IDS_Process(const Mms_Frame_t *frame)
 
     if (!parse_mms_frame(frame->data, frame->length, now_ms, &p))
     {
-        MMS_Event_t e;
-        memset(&e, 0, sizeof(e));
-        e.type = MMS_EVENT_MALFORMED_FRAME;
-        e.severity = SEC_SEV_HIGH;
-        e.timestamp_ms = now_ms;
-        snprintf(e.details, sizeof(e.details), "Malformed IPv4/TCP MMS packet (len=%u)", frame->length);
-        emit_mms_event(&e);
+        memset(&s_mms_event, 0, sizeof(s_mms_event));
+        s_mms_event.type = MMS_EVENT_MALFORMED_FRAME;
+        s_mms_event.severity = SEC_SEV_HIGH;
+        s_mms_event.timestamp_ms = now_ms;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "Malformed IPv4/TCP MMS packet (len=%u)", frame->length);
+        emit_mms_event(&s_mms_event);
         return MMS_EVENT_MALFORMED_FRAME;
     }
 
@@ -318,12 +392,11 @@ MMS_EventType_t Mms_IDS_Process(const Mms_Frame_t *frame)
     if (cfg == NULL || state != SCD_CONFIG_STATE_READY || !cfg->isValid)
     {
         SCD_Config_Unlock();
-        MMS_Event_t e;
-        fill_mms_event_base(&e, &p, NULL, NULL);
-        e.type = MMS_EVENT_UNKNOWN_ENDPOINT;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "No active SCD configuration for MMS");
-        emit_mms_event(&e);
+        fill_mms_event_base(&s_mms_event, &p, NULL, NULL);
+        s_mms_event.type = MMS_EVENT_UNKNOWN_ENDPOINT;
+        s_mms_event.severity = SEC_SEV_HIGH;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "No active SCD configuration for MMS");
+        emit_mms_event(&s_mms_event);
         return MMS_EVENT_UNKNOWN_ENDPOINT;
     }
 
@@ -332,61 +405,69 @@ MMS_EventType_t Mms_IDS_Process(const Mms_Frame_t *frame)
     const SCD_IED_t *src_ied = SCD_Config_FindIEDByIP(p.src_ip);
     const SCD_MMS_t *src_mms = SCD_Config_FindMMSByIP(p.src_ip);
 
-    MMS_Event_t e;
-    fill_mms_event_base(&e, &p, mms_server, dst_ied);
-    MMS_EventType_t result = MMS_EVENT_ACCEPT;
-
-    if (mms_server == NULL && dst_ied == NULL)
+    SystemConfig_t sys_cfg;
+    SystemConfig_Get(&sys_cfg);
+    if (!sys_cfg.mms.inspection_enabled)
     {
-        e.type = MMS_EVENT_UNKNOWN_DESTINATION;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "MMS connection to unknown destination IP %s:%u",
+        SCD_Config_Unlock();
+        return MMS_EVENT_ACCEPT;
+    }
+
+    fill_mms_event_base(&s_mms_event, &p, mms_server, dst_ied);
+    MMS_EventType_t result = MMS_EVENT_ACCEPT;
+    uint16_t expected_port = (sys_cfg.mms.tcp_port > 0) ? sys_cfg.mms.tcp_port : 102;
+
+    if (sys_cfg.mms.baseline_check_enabled && mms_server == NULL && dst_ied == NULL)
+    {
+        s_mms_event.type = MMS_EVENT_UNKNOWN_DESTINATION;
+        s_mms_event.severity = SEC_SEV_HIGH;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "MMS connection to unknown destination IP %s:%u",
                  p.dst_ip, (unsigned int)p.dst_port);
         result = MMS_EVENT_UNKNOWN_DESTINATION;
     }
-    else if (src_ied == NULL && src_mms == NULL)
+    else if (sys_cfg.mms.baseline_check_enabled && src_ied == NULL && src_mms == NULL)
     {
-        e.type = MMS_EVENT_UNKNOWN_SOURCE;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "MMS connection from unauthorized/unknown source IP %s",
+        s_mms_event.type = MMS_EVENT_UNKNOWN_SOURCE;
+        s_mms_event.severity = SEC_SEV_HIGH;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "MMS connection from unauthorized/unknown source IP %s",
                  p.src_ip);
         result = MMS_EVENT_UNKNOWN_SOURCE;
     }
-    else if (mms_server == NULL && dst_ied != NULL)
+    else if (sys_cfg.mms.baseline_check_enabled && mms_server == NULL && dst_ied != NULL)
     {
-        e.type = MMS_EVENT_UNEXPECTED_ENDPOINT;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "MMS access to non-MMS interface %s (AP=%s - SV Process Bus only)",
+        s_mms_event.type = MMS_EVENT_UNEXPECTED_ENDPOINT;
+        s_mms_event.severity = SEC_SEV_HIGH;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "MMS access to non-MMS interface %s (AP=%s - SV Process Bus only)",
                  dst_ied->id, dst_ied->apName);
         result = MMS_EVENT_UNEXPECTED_ENDPOINT;
     }
-    else if (p.dst_port != 102 && p.dst_port != 8080 && p.dst_port != 3782)
+    else if (p.dst_port != expected_port && p.dst_port != 8080 && p.dst_port != 3782)
     {
-        e.type = MMS_EVENT_UNAUTHORIZED_PORT;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "Unauthorized MMS TCP port %u (expected 102)",
-                 (unsigned int)p.dst_port);
+        s_mms_event.type = MMS_EVENT_UNAUTHORIZED_PORT;
+        s_mms_event.severity = SEC_SEV_HIGH;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "Unauthorized MMS TCP port %u (expected %u)",
+                 (unsigned int)p.dst_port, (unsigned int)expected_port);
         result = MMS_EVENT_UNAUTHORIZED_PORT;
     }
     else if (p.has_cotp && (strcmp(p.src_tsel, "0001") != 0 || strcmp(p.dst_tsel, "0001") != 0))
     {
-        e.type = MMS_EVENT_TSEL_MISMATCH;
-        e.severity = SEC_SEV_WARNING;
-        snprintf(e.details, sizeof(e.details), "COTP TSEL mismatch: src=%s dst=%s (expected 0001)",
+        s_mms_event.type = MMS_EVENT_TSEL_MISMATCH;
+        s_mms_event.severity = SEC_SEV_WARNING;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "COTP TSEL mismatch: src=%s dst=%s (expected 0001)",
                  p.src_tsel, p.dst_tsel);
         result = MMS_EVENT_TSEL_MISMATCH;
     }
     else if (p.is_mms_write)
     {
-        e.type = MMS_EVENT_UNAUTHORIZED_WRITE;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "Unauthorized SCADA Control Write from %s to %s",
+        s_mms_event.type = MMS_EVENT_UNAUTHORIZED_WRITE;
+        s_mms_event.severity = SEC_SEV_CRITICAL;
+        snprintf(s_mms_event.details, sizeof(s_mms_event.details), "Unauthorized SCADA Control Write from %s to %s",
                  p.src_ip, mms_server ? mms_server->ied : dst_ied->id);
         result = MMS_EVENT_UNAUTHORIZED_WRITE;
     }
 
     SCD_Config_Unlock();
-    emit_mms_event(&e);
+    emit_mms_event(&s_mms_event);
     return result;
 }
 
@@ -416,7 +497,6 @@ void Mms_Enqueue(struct pbuf *p)
     Mms_Frame_t *frame = (Mms_Frame_t *)osPoolAlloc(MmsPoolHandle);
     if (frame == NULL)
     {
-        printf("[MMS] Pool alloc failed, dropping frame\n");
         return;
     }
 
@@ -425,7 +505,6 @@ void Mms_Enqueue(struct pbuf *p)
 
     if (osMessagePut(MMSQueueHandle, (uint32_t)frame, 0) != osOK)
     {
-        printf("[MMS] Queue full, dropping frame\n");
         osPoolFree(MmsPoolHandle, frame);
     }
 }
@@ -476,7 +555,7 @@ const char *Mms_EventToString(MMS_EventType_t type)
     switch (type)
     {
     case MMS_EVENT_ACCEPT:
-        return "MMS_ACCEPT";
+        return "MMS_TRAFFIC_NORMAL";
     case MMS_EVENT_UNKNOWN_ENDPOINT:
         return "MMS_UNKNOWN_ENDPOINT";
     case MMS_EVENT_UNKNOWN_SOURCE:

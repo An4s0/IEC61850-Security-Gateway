@@ -2,6 +2,7 @@
 #include "goose.h"
 #include "sv.h"
 #include "mms.h"
+#include "system_config.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -11,11 +12,18 @@
 #define RAW_ETH_TYPE_IPV4 0x0800
 
 /**
- * @brief Checks whether an IPv4 packet contains MMS traffic (TCP port 102).
+ * @brief Checks whether an IPv4 packet contains MMS traffic based on active configuration.
  */
 static inline bool is_mms_packet(struct pbuf *p, uint16_t ip_offset)
 {
     if (p == NULL || p->tot_len < ip_offset + 24)
+    {
+        return false;
+    }
+
+    SystemConfig_t sys_cfg;
+    SystemConfig_Get(&sys_cfg);
+    if (!sys_cfg.mms.inspection_enabled)
     {
         return false;
     }
@@ -45,25 +53,28 @@ static inline bool is_mms_packet(struct pbuf *p, uint16_t ip_offset)
 
     uint16_t src_port = (uint16_t)((tcp_hdr[0] << 8) | tcp_hdr[1]);
     uint16_t dst_port = (uint16_t)((tcp_hdr[2] << 8) | tcp_hdr[3]);
+    uint16_t mms_port = (sys_cfg.mms.tcp_port > 0) ? sys_cfg.mms.tcp_port : 102;
 
-    return (src_port == 102 || dst_port == 102);
+    return (src_port == mms_port || dst_port == mms_port);
 }
 
 /**
  * @brief Classifies an incoming raw Ethernet packet and dispatches to the appropriate protocol handler.
  * @param p Pointer to the lwIP packet buffer containing the raw Ethernet frame.
+ * @return true if packet is a pure Layer-2 frame (SV or GOOSE) that should NOT be passed to lwIP;
+ *         false if packet must continue through lwIP (IPv4/MMS, ARP, etc.).
  */
-void RawEth_Process(struct pbuf *p)
+bool RawEth_Process(struct pbuf *p)
 {
     if (p == NULL || p->tot_len < 14)
     {
-        return;
+        return false;
     }
 
     uint8_t hdr[14];
     if (pbuf_copy_partial(p, hdr, 14, 0) != 14)
     {
-        return;
+        return false;
     }
 
     uint16_t etype = (uint16_t)((hdr[12] << 8) | hdr[13]);
@@ -72,18 +83,18 @@ void RawEth_Process(struct pbuf *p)
     {
     case RAW_ETH_TYPE_GOOSE:
         Goose_Enqueue(p);
-        break;
+        return true;
 
     case RAW_ETH_TYPE_SV:
         Sv_Enqueue(p);
-        break;
+        return true;
 
     case RAW_ETH_TYPE_IPV4:
         if (is_mms_packet(p, 14))
         {
             Mms_Enqueue(p);
         }
-        break;
+        return false;
 
     case RAW_ETH_TYPE_VLAN:
         if (p->tot_len >= 18)
@@ -95,20 +106,23 @@ void RawEth_Process(struct pbuf *p)
                 if (inner_type == RAW_ETH_TYPE_GOOSE)
                 {
                     Goose_Enqueue(p);
+                    return true;
                 }
                 else if (inner_type == RAW_ETH_TYPE_SV)
                 {
                     Sv_Enqueue(p);
+                    return true;
                 }
                 else if (inner_type == RAW_ETH_TYPE_IPV4 && is_mms_packet(p, 18))
                 {
                     Mms_Enqueue(p);
+                    return false;
                 }
             }
         }
-        break;
+        return false;
 
     default:
-        break;
+        return false;
     }
 }

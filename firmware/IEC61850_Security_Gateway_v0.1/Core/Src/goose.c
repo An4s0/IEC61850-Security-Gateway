@@ -1,5 +1,7 @@
 #include "goose.h"
 #include "main.h"
+#include "system_config.h"
+#include "system_logger.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
@@ -261,6 +263,11 @@ static bool parse_frame(const uint8_t *data, uint16_t len, uint32_t now_ms, Pars
     return true;
 }
 
+static GOOSE_Event_t s_goose_event;
+static char s_goose_target_str[128];
+static uint32_t s_last_goose_print_tick = 0;
+static uint32_t s_goose_suppressed_prints = 0;
+
 /**
  * @brief Matches a parsed GOOSE frame against active SCD configuration control blocks.
  * @param cfg Pointer to active SCD configuration.
@@ -289,7 +296,8 @@ static const SCD_GOOSE_t *find_scd_match(const SCD_Config_t *cfg, const ParsedGo
                 *idx = (int)i;
                 return g;
             }
-            if (strstr(p->gocb_ref, g->controlBlock) && strstr(p->gocb_ref, g->publisherIed))
+            if (g->controlBlock[0] != '\0' && g->publisherIed[0] != '\0' &&
+                strstr(p->gocb_ref, g->controlBlock) && strstr(p->gocb_ref, g->publisherIed))
             {
                 *idx = (int)i;
                 return g;
@@ -302,7 +310,8 @@ static const SCD_GOOSE_t *find_scd_match(const SCD_Config_t *cfg, const ParsedGo
         for (uint16_t i = 0; i < cfg->numGoose; i++)
         {
             const SCD_GOOSE_t *g = &cfg->goose[i];
-            if (strstr(p->go_id, g->controlBlock) && strstr(p->go_id, g->publisherIed))
+            if (g->controlBlock[0] != '\0' && g->publisherIed[0] != '\0' &&
+                strstr(p->go_id, g->controlBlock) && strstr(p->go_id, g->publisherIed))
             {
                 *idx = (int)i;
                 return g;
@@ -344,21 +353,49 @@ static void emit_event(const GOOSE_Event_t *e)
 
     if (e->type != GOOSE_EVENT_ACCEPT)
     {
-        printf("[IDS] Event: %s | Sev: %s | SrcMAC: %02X:%02X:%02X:%02X:%02X:%02X | Details: %s\n",
-               Goose_EventToString(e->type),
-               Security_SeverityToString(e->severity),
-               e->src_mac[0], e->src_mac[1], e->src_mac[2],
-               e->src_mac[3], e->src_mac[4], e->src_mac[5],
-               e->details);
+        SystemConfig_t sys_cfg;
+        SystemConfig_Get(&sys_cfg);
+        uint32_t now = HAL_GetTick();
+        bool print_to_console = (e->type != GOOSE_EVENT_APPID_MISMATCH &&
+                                 e->type != GOOSE_EVENT_MAC_MISMATCH &&
+                                 e->type != GOOSE_EVENT_VLAN_MISMATCH);
+        if (print_to_console)
+        {
+            if ((now - s_last_goose_print_tick) >= sys_cfg.alerts.anomaly_print_interval_ms)
+            {
+                if (s_goose_suppressed_prints > 0)
+                {
+                    SysLog_Print(SYSLOG_LEVEL_DEBUG, "IDS", "GOOSE: %lu anomaly events suppressed in last %lu ms",
+                                 (unsigned long)s_goose_suppressed_prints, (unsigned long)(now - s_last_goose_print_tick));
+                    s_goose_suppressed_prints = 0;
+                }
+                s_last_goose_print_tick = now;
 
-        char target_str[128] = {0};
+                if (e->severity >= SEC_SEV_HIGH)
+                {
+                    printf("[IDS] %s | %s | %02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+                           Goose_EventToString(e->type),
+                           Security_SeverityToString(e->severity),
+                           e->src_mac[0], e->src_mac[1], e->src_mac[2],
+                           e->src_mac[3], e->src_mac[4], e->src_mac[5],
+                           e->dst_mac[0], e->dst_mac[1], e->dst_mac[2],
+                           e->dst_mac[3], e->dst_mac[4], e->dst_mac[5]);
+                }
+            }
+            else
+            {
+                s_goose_suppressed_prints++;
+            }
+        }
+
+        s_goose_target_str[0] = '\0';
         if (e->ied[0] != '\0' || e->cb[0] != '\0')
         {
-            snprintf(target_str, sizeof(target_str), "%s/%s", e->ied, e->cb);
+            snprintf(s_goose_target_str, sizeof(s_goose_target_str), "%s/%s", e->ied, e->cb);
         }
 
         Security_AlertLog_t alert = {
-            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : HAL_GetTick(),
+            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : now,
             .frame_timestamp_ms = e->frame_timestamp_ms,
             .protocol = SEC_PROTO_GOOSE,
             .severity = e->severity,
@@ -367,7 +404,7 @@ static void emit_event(const GOOSE_Event_t *e)
             .dst_mac = e->dst_mac,
             .src_ip = NULL,
             .dst_ip = NULL,
-            .target = target_str[0] ? target_str : NULL,
+            .target = s_goose_target_str[0] ? s_goose_target_str : NULL,
             .app_id = e->app_id,
             .vlan_id = e->vlan_id,
             .conf_rev = e->conf_rev,
@@ -377,6 +414,43 @@ static void emit_event(const GOOSE_Event_t *e)
             .recommendation = NULL};
 
         Security_LogAlertToSD(&alert);
+    }
+    else
+    {
+        SystemConfig_t sys_cfg;
+        SystemConfig_Get(&sys_cfg);
+        uint32_t now = HAL_GetTick();
+        static uint32_t s_last_goose_normal_tick = 0;
+        if ((now - s_last_goose_normal_tick) >= sys_cfg.alerts.normal_traffic_log_interval_ms || s_last_goose_normal_tick == 0)
+        {
+            s_last_goose_normal_tick = now;
+            s_goose_target_str[0] = '\0';
+            if (e->ied[0] != '\0' || e->cb[0] != '\0')
+            {
+                snprintf(s_goose_target_str, sizeof(s_goose_target_str), "%s/%s", e->ied, e->cb);
+            }
+
+            Security_AlertLog_t alert = {
+                .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : now,
+                .frame_timestamp_ms = e->frame_timestamp_ms,
+                .protocol = SEC_PROTO_GOOSE,
+                .severity = SEC_SEV_INFO,
+                .event_type = Goose_EventToString(e->type),
+                .src_mac = e->src_mac,
+                .dst_mac = e->dst_mac,
+                .src_ip = NULL,
+                .dst_ip = NULL,
+                .target = s_goose_target_str[0] ? s_goose_target_str : NULL,
+                .app_id = e->app_id,
+                .vlan_id = e->vlan_id,
+                .conf_rev = e->conf_rev,
+                .st_num = e->st_num,
+                .sq_num = e->sq_num,
+                .details = "Normal GOOSE traffic validated against active SCD baseline",
+                .recommendation = NULL};
+
+            Security_LogAlertToSD(&alert);
+        }
     }
 }
 
@@ -411,8 +485,8 @@ static void fill_event_base(GOOSE_Event_t *e, const ParsedGoose_t *p, const SCD_
 }
 
 /**
- * @brief Validates a GOOSE frame against the active SCD configuration.
- * @param frame Pointer to the raw received GOOSE frame.
+ * @brief Validates a GOOSE frame against active SCD configuration.
+ * @param frame Pointer to raw received GOOSE frame.
  * @return Detection result event type.
  */
 GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
@@ -427,17 +501,16 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
 
     if (!parse_frame(frame->data, frame->length, now_ms, &p))
     {
-        GOOSE_Event_t e;
-        fill_event_base(&e, &p, NULL);
-        e.type = GOOSE_EVENT_MALFORMED_FRAME;
-        e.severity = SEC_SEV_HIGH;
+        fill_event_base(&s_goose_event, &p, NULL);
+        s_goose_event.type = GOOSE_EVENT_MALFORMED_FRAME;
+        s_goose_event.severity = SEC_SEV_HIGH;
         if (frame->length >= 12)
         {
-            memcpy(e.dst_mac, &frame->data[0], SCD_MAC_ADDR_LEN);
-            memcpy(e.src_mac, &frame->data[6], SCD_MAC_ADDR_LEN);
+            memcpy(s_goose_event.dst_mac, &frame->data[0], SCD_MAC_ADDR_LEN);
+            memcpy(s_goose_event.src_mac, &frame->data[6], SCD_MAC_ADDR_LEN);
         }
-        snprintf(e.details, sizeof(e.details), "Malformed frame (len=%u)", frame->length);
-        emit_event(&e);
+        snprintf(s_goose_event.details, sizeof(s_goose_event.details), "Malformed frame (len=%u)", frame->length);
+        emit_event(&s_goose_event);
         return GOOSE_EVENT_MALFORMED_FRAME;
     }
 
@@ -448,12 +521,11 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
     if (cfg == NULL || state != SCD_CONFIG_STATE_READY || !cfg->isValid)
     {
         SCD_Config_Unlock();
-        GOOSE_Event_t e;
-        fill_event_base(&e, &p, NULL);
-        e.type = GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "No active SCD configuration");
-        emit_event(&e);
+        fill_event_base(&s_goose_event, &p, NULL);
+        s_goose_event.type = GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK;
+        s_goose_event.severity = SEC_SEV_HIGH;
+        snprintf(s_goose_event.details, sizeof(s_goose_event.details), "No active SCD configuration");
+        emit_event(&s_goose_event);
         return GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK;
     }
 
@@ -469,142 +541,210 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
     if (g == NULL || idx < 0 || idx >= SCD_MAX_GOOSE)
     {
         SCD_Config_Unlock();
-        GOOSE_Event_t e;
-        fill_event_base(&e, &p, NULL);
-        e.type = GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "Unknown CB (ref='%.48s' appid=0x%04X)",
+        fill_event_base(&s_goose_event, &p, NULL);
+        s_goose_event.type = GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK;
+        s_goose_event.severity = SEC_SEV_HIGH;
+        snprintf(s_goose_event.details, sizeof(s_goose_event.details), "Unknown CB (ref='%.48s' appid=0x%04X)",
                  p.gocb_ref[0] ? p.gocb_ref : "-", p.app_id);
-        emit_event(&e);
+        emit_event(&s_goose_event);
         return GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK;
     }
 
-    GOOSE_Event_t e;
-    fill_event_base(&e, &p, g);
+    fill_event_base(&s_goose_event, &p, g);
     GOOSE_EventType_t result = GOOSE_EVENT_ACCEPT;
 
-    if (memcmp(p.dst_mac, g->mac, SCD_MAC_ADDR_LEN) != 0)
+    SystemConfig_t sys_cfg;
+    SystemConfig_Get(&sys_cfg);
+
+    bool baseline_mismatch = false;
+    if (sys_cfg.goose.baseline_check_enabled)
     {
-        e.type = GOOSE_EVENT_MAC_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "DST MAC %02X:%02X:%02X:%02X:%02X:%02X != %s",
-                 p.dst_mac[0], p.dst_mac[1], p.dst_mac[2],
-                 p.dst_mac[3], p.dst_mac[4], p.dst_mac[5], g->macStr);
-        result = GOOSE_EVENT_MAC_MISMATCH;
+        if (memcmp(p.dst_mac, g->mac, SCD_MAC_ADDR_LEN) != 0)
+        {
+            s_goose_event.type = GOOSE_EVENT_MAC_MISMATCH;
+            s_goose_event.severity = SEC_SEV_HIGH;
+            snprintf(s_goose_event.details, sizeof(s_goose_event.details), "DST MAC %02X:%02X:%02X:%02X:%02X:%02X != %s",
+                     p.dst_mac[0], p.dst_mac[1], p.dst_mac[2],
+                     p.dst_mac[3], p.dst_mac[4], p.dst_mac[5], g->macStr);
+            result = GOOSE_EVENT_MAC_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.app_id != g->appId)
+        {
+            s_goose_event.type = GOOSE_EVENT_APPID_MISMATCH;
+            s_goose_event.severity = SEC_SEV_HIGH;
+            snprintf(s_goose_event.details, sizeof(s_goose_event.details), "APPID 0x%04X != 0x%04X", p.app_id, g->appId);
+            result = GOOSE_EVENT_APPID_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if ((g->vlanId > 0 && !p.is_vlan_tagged) ||
+                 (g->vlanId > 0 && p.vlan_id != g->vlanId) ||
+                 (g->vlanId == 0 && p.is_vlan_tagged))
+        {
+            s_goose_event.type = GOOSE_EVENT_VLAN_MISMATCH;
+            s_goose_event.severity = SEC_SEV_HIGH;
+            snprintf(s_goose_event.details, sizeof(s_goose_event.details), "VLAN %u != %u (tagged=%d)",
+                     p.vlan_id, g->vlanId, p.is_vlan_tagged);
+            result = GOOSE_EVENT_VLAN_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.is_vlan_tagged && g->vlanId > 0 && p.vlan_priority != g->vlanPriority)
+        {
+            s_goose_event.type = GOOSE_EVENT_VLAN_PRIORITY_MISMATCH;
+            s_goose_event.severity = SEC_SEV_WARNING;
+            snprintf(s_goose_event.details, sizeof(s_goose_event.details), "VLAN priority %u != %u",
+                     p.vlan_priority, g->vlanPriority);
+            result = GOOSE_EVENT_VLAN_PRIORITY_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.conf_rev != g->confRev)
+        {
+            s_goose_event.type = GOOSE_EVENT_CONFREV_MISMATCH;
+            s_goose_event.severity = SEC_SEV_HIGH;
+            snprintf(s_goose_event.details, sizeof(s_goose_event.details), "confRev %lu != %lu",
+                     (unsigned long)p.conf_rev, (unsigned long)g->confRev);
+            result = GOOSE_EVENT_CONFREV_MISMATCH;
+            baseline_mismatch = true;
+        }
     }
-    else if (p.app_id != g->appId)
-    {
-        e.type = GOOSE_EVENT_APPID_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "APPID 0x%04X != 0x%04X", p.app_id, g->appId);
-        result = GOOSE_EVENT_APPID_MISMATCH;
-    }
-    else if ((g->vlanId > 0 && !p.is_vlan_tagged) ||
-             (g->vlanId > 0 && p.vlan_id != g->vlanId) ||
-             (g->vlanId == 0 && p.is_vlan_tagged))
-    {
-        e.type = GOOSE_EVENT_VLAN_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "VLAN %u != %u (tagged=%d)",
-                 p.vlan_id, g->vlanId, p.is_vlan_tagged);
-        result = GOOSE_EVENT_VLAN_MISMATCH;
-    }
-    else if (p.is_vlan_tagged && g->vlanId > 0 && p.vlan_priority != g->vlanPriority)
-    {
-        e.type = GOOSE_EVENT_VLAN_PRIORITY_MISMATCH;
-        e.severity = SEC_SEV_WARNING;
-        snprintf(e.details, sizeof(e.details), "VLAN priority %u != %u",
-                 p.vlan_priority, g->vlanPriority);
-        result = GOOSE_EVENT_VLAN_PRIORITY_MISMATCH;
-    }
-    else if (p.conf_rev != g->confRev)
-    {
-        e.type = GOOSE_EVENT_CONFREV_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "confRev %lu != %lu",
-                 (unsigned long)p.conf_rev, (unsigned long)g->confRev);
-        result = GOOSE_EVENT_CONFREV_MISMATCH;
-    }
-    else
+
+    if (!baseline_mismatch)
     {
         StreamState_t *st = &g_streams[idx];
+        uint32_t max_time = (g->maxTimeMs > 0) ? g->maxTimeMs : sys_cfg.goose.max_time_fallback_ms;
+        uint32_t min_time = (g->minTimeMs > 0) ? g->minTimeMs : sys_cfg.goose.min_time_fallback_ms;
+        uint32_t ttl_mult = (sys_cfg.goose.ttl_multiplier > 0) ? sys_cfg.goose.ttl_multiplier : 2;
 
-        if (st->initialized)
+        if (!st->initialized)
+        {
+            st->initialized = true;
+            st->last_st_num = p.st_num;
+            st->last_sq_num = p.sq_num;
+            st->last_rx_ms = p.rx_ms;
+            st->last_ttl_ms = (p.time_allowed_to_live > 0) ? p.time_allowed_to_live : (max_time * ttl_mult);
+            result = GOOSE_EVENT_ACCEPT;
+        }
+        else
         {
             uint32_t delta = (p.rx_ms >= st->last_rx_ms)
                                  ? (p.rx_ms - st->last_rx_ms)
                                  : (0xFFFFFFFF - st->last_rx_ms + p.rx_ms + 1);
 
-            uint32_t min_time = (g->minTimeMs > 0) ? g->minTimeMs : 4;
-            uint32_t max_time = (g->maxTimeMs > 0) ? g->maxTimeMs : 1000;
             uint32_t ttl_ms = (st->last_ttl_ms > 0)
                                   ? st->last_ttl_ms
                                   : ((p.time_allowed_to_live > 0)
                                          ? p.time_allowed_to_live
-                                         : (max_time * 2));
+                                         : (max_time * ttl_mult));
 
             bool is_expired = (delta > ttl_ms);
             bool is_valid_restart = (is_expired && p.sq_num == 0);
 
-            if (p.st_num < st->last_st_num && !is_valid_restart)
+            if (p.st_num > st->last_st_num)
             {
-                e.type = GOOSE_EVENT_STATE_ANOMALY;
-                e.severity = SEC_SEV_HIGH;
-                snprintf(e.details, sizeof(e.details), "stNum rollback %lu -> %lu",
-                         (unsigned long)st->last_st_num, (unsigned long)p.st_num);
-                result = GOOSE_EVENT_STATE_ANOMALY;
+                result = GOOSE_EVENT_ACCEPT;
             }
-            else if (p.st_num == st->last_st_num && p.sq_num < st->last_sq_num && !is_valid_restart && !(st->last_sq_num > 0xFFFFFF00 && p.sq_num < 100))
+            else if (p.st_num < st->last_st_num)
             {
-                e.type = GOOSE_EVENT_STATE_ANOMALY;
-                e.severity = SEC_SEV_WARNING;
-                snprintf(e.details, sizeof(e.details), "sqNum rollback %lu -> %lu",
-                         (unsigned long)st->last_sq_num, (unsigned long)p.sq_num);
-                result = GOOSE_EVENT_STATE_ANOMALY;
+                if (is_valid_restart || !sys_cfg.goose.state_check_enabled)
+                {
+                    result = GOOSE_EVENT_ACCEPT;
+                }
+                else
+                {
+                    s_goose_event.type = GOOSE_EVENT_STATE_ANOMALY;
+                    s_goose_event.severity = SEC_SEV_HIGH;
+                    snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                             "stNum rollback %lu -> %lu",
+                             (unsigned long)st->last_st_num, (unsigned long)p.st_num);
+                    result = GOOSE_EVENT_STATE_ANOMALY;
+                }
             }
-            else if (p.st_num == st->last_st_num && p.sq_num == st->last_sq_num)
+            else
             {
-                e.type = GOOSE_EVENT_STATE_ANOMALY;
-                e.severity = SEC_SEV_WARNING;
-                snprintf(e.details, sizeof(e.details), "sqNum duplicate %lu",
-                         (unsigned long)p.sq_num);
-                result = GOOSE_EVENT_STATE_ANOMALY;
+                if (p.sq_num == st->last_sq_num)
+                {
+                    if (is_valid_restart || !sys_cfg.goose.state_check_enabled)
+                    {
+                        result = GOOSE_EVENT_ACCEPT;
+                    }
+                    else
+                    {
+                        s_goose_event.type = GOOSE_EVENT_STATE_ANOMALY;
+                        s_goose_event.severity = SEC_SEV_WARNING;
+                        snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                                 "sqNum duplicate %lu",
+                                 (unsigned long)p.sq_num);
+                        result = GOOSE_EVENT_STATE_ANOMALY;
+                    }
+                }
+                else if (p.sq_num < st->last_sq_num && !(st->last_sq_num > 0xFFFFFF00 && p.sq_num < 100))
+                {
+                    if (is_valid_restart || !sys_cfg.goose.state_check_enabled)
+                    {
+                        result = GOOSE_EVENT_ACCEPT;
+                    }
+                    else
+                    {
+                        s_goose_event.type = GOOSE_EVENT_STATE_ANOMALY;
+                        s_goose_event.severity = SEC_SEV_WARNING;
+                        snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                                 "sqNum rollback %lu -> %lu",
+                                 (unsigned long)st->last_sq_num, (unsigned long)p.sq_num);
+                        result = GOOSE_EVENT_STATE_ANOMALY;
+                    }
+                }
+                else
+                {
+                    if (sys_cfg.goose.timing_check_enabled && (delta + 1) < min_time)
+                    {
+                        s_goose_event.type = GOOSE_EVENT_TIMING_FAST;
+                        s_goose_event.severity = SEC_SEV_WARNING;
+                        snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                                 "Fast: %lu ms < minTime %lu ms",
+                                 (unsigned long)delta, (unsigned long)min_time);
+                        result = GOOSE_EVENT_TIMING_FAST;
+                    }
+                    else if (sys_cfg.goose.timing_check_enabled && is_expired)
+                    {
+                        s_goose_event.type = GOOSE_EVENT_TIMING_SLOW;
+                        s_goose_event.severity = SEC_SEV_WARNING;
+                        snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                                 "Slow: %lu ms > TTL %lu ms",
+                                 (unsigned long)delta, (unsigned long)ttl_ms);
+                        result = GOOSE_EVENT_TIMING_SLOW;
+                    }
+                    else
+                    {
+                        result = GOOSE_EVENT_ACCEPT;
+                    }
+                }
             }
 
-            if (result == GOOSE_EVENT_ACCEPT)
-            {
-                if (delta < min_time)
-                {
-                    e.type = GOOSE_EVENT_TIMING_FAST;
-                    e.severity = SEC_SEV_WARNING;
-                    snprintf(e.details, sizeof(e.details), "Fast: %lu ms < minTime %lu ms",
-                             (unsigned long)delta, (unsigned long)min_time);
-                    result = GOOSE_EVENT_TIMING_FAST;
-                }
-                else if (is_expired && !is_valid_restart)
-                {
-                    e.type = GOOSE_EVENT_TIMING_SLOW;
-                    e.severity = SEC_SEV_WARNING;
-                    snprintf(e.details, sizeof(e.details), "Slow: %lu ms > TTL %lu ms",
-                             (unsigned long)delta, (unsigned long)ttl_ms);
-                    result = GOOSE_EVENT_TIMING_SLOW;
-                }
-            }
+            st->last_st_num = p.st_num;
+            st->last_sq_num = p.sq_num;
+            st->last_rx_ms = p.rx_ms;
+            st->last_ttl_ms = (p.time_allowed_to_live > 0)
+                                  ? p.time_allowed_to_live
+                                  : (max_time * ttl_mult);
         }
-
-        uint32_t max_time = (g->maxTimeMs > 0) ? g->maxTimeMs : 1000;
-        st->initialized = true;
-        st->last_st_num = p.st_num;
-        st->last_sq_num = p.sq_num;
-        st->last_rx_ms = p.rx_ms;
-        st->last_ttl_ms = (p.time_allowed_to_live > 0)
-                              ? p.time_allowed_to_live
-                              : (max_time * 2);
     }
 
     SCD_Config_Unlock();
-    emit_event(&e);
+    emit_event(&s_goose_event);
     return result;
+}
+
+static Goose_Stats_t s_goose_stats = {0};
+
+/**
+ * @brief Copies the current GOOSE statistics to the provided structure.
+ */
+void Goose_GetStats(Goose_Stats_t *stats)
+{
+    if (stats != NULL)
+    {
+        *stats = s_goose_stats;
+    }
 }
 
 /**
@@ -632,10 +772,12 @@ void Goose_Enqueue(struct pbuf *p)
         return;
     }
 
+    s_goose_stats.frames_received++;
+
     Goose_Frame_t *frame = (Goose_Frame_t *)osPoolAlloc(GoosePoolHandle);
     if (frame == NULL)
     {
-        printf("[GOOSE] Pool alloc failed, dropping frame\n");
+        s_goose_stats.pool_alloc_failures++;
         return;
     }
 
@@ -644,7 +786,7 @@ void Goose_Enqueue(struct pbuf *p)
 
     if (osMessagePut(GooseQueueHandle, (uint32_t)frame, 0) != osOK)
     {
-        printf("[GOOSE] Queue full, dropping frame\n");
+        s_goose_stats.queue_sends_failed++;
         osPoolFree(GoosePoolHandle, frame);
     }
 }
@@ -671,6 +813,7 @@ void Goose_Task(void const *argument)
             Goose_Frame_t *frame = (Goose_Frame_t *)evt.value.v;
             if (frame != NULL)
             {
+                s_goose_stats.frames_processed++;
                 Goose_IDS_Process(frame);
                 if (GoosePoolHandle != NULL)
                 {
@@ -695,7 +838,7 @@ const char *Goose_EventToString(GOOSE_EventType_t type)
     switch (type)
     {
     case GOOSE_EVENT_ACCEPT:
-        return "GOOSE_ACCEPT";
+        return "GOOSE_TRAFFIC_NORMAL";
     case GOOSE_EVENT_UNKNOWN_CONTROL_BLOCK:
         return "GOOSE_UNKNOWN_CONTROL_BLOCK";
     case GOOSE_EVENT_MAC_MISMATCH:

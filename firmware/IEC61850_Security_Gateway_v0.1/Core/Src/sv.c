@@ -1,5 +1,7 @@
 #include "sv.h"
 #include "main.h"
+#include "system_config.h"
+#include "system_logger.h"
 #include "cmsis_os.h"
 #include <string.h>
 #include <stdio.h>
@@ -301,6 +303,11 @@ static bool parse_sv_frame(const uint8_t *data, uint16_t len, uint32_t now_ms, P
     return true;
 }
 
+static SV_Event_t s_sv_event;
+static char s_sv_target_str[128];
+static uint32_t s_last_sv_print_tick = 0;
+static uint32_t s_sv_suppressed_prints = 0;
+
 /**
  * @brief Matches a parsed SV frame against active SCD configuration control blocks.
  * @param cfg Pointer to active SCD configuration.
@@ -320,7 +327,8 @@ static const SCD_SV_t *find_sv_scd_match(const SCD_Config_t *cfg, const ParsedSv
                 *idx = (int)i;
                 return s;
             }
-            if (strstr(p->sv_id, s->controlBlock) && strstr(p->sv_id, s->publisherIed))
+            if (s->controlBlock[0] != '\0' && s->publisherIed[0] != '\0' &&
+                strstr(p->sv_id, s->controlBlock) && strstr(p->sv_id, s->publisherIed))
             {
                 *idx = (int)i;
                 return s;
@@ -362,25 +370,37 @@ static void emit_sv_event(const SV_Event_t *e)
 
     if (e->type != SV_EVENT_ACCEPT)
     {
-        printf("[IDS] SV Event: %s | Sev: %s | SrcMAC: %02X:%02X:%02X:%02X:%02X:%02X | Details: %s\n",
-               Sv_EventToString(e->type),
-               Security_SeverityToString(e->severity),
-               e->src_mac[0], e->src_mac[1], e->src_mac[2],
-               e->src_mac[3], e->src_mac[4], e->src_mac[5],
-               e->details);
+        SystemConfig_t sys_cfg;
+        SystemConfig_Get(&sys_cfg);
+        uint32_t now = HAL_GetTick();
+        if ((now - s_last_sv_print_tick) >= sys_cfg.alerts.anomaly_print_interval_ms)
+        {
+            if (s_sv_suppressed_prints > 0)
+            {
+                SysLog_Print(SYSLOG_LEVEL_DEBUG, "IDS", "SV: %lu anomaly events suppressed in last %lu ms",
+                             (unsigned long)s_sv_suppressed_prints, (unsigned long)(now - s_last_sv_print_tick));
+                s_sv_suppressed_prints = 0;
+            }
+            (void)s_sv_suppressed_prints;
+        }
+        else
+        {
+            s_sv_suppressed_prints++;
+        }
 
-        char target_str[128] = {0};
+        s_sv_target_str[0] = '\0';
         if (e->ied[0] != '\0' || e->cb[0] != '\0')
         {
-            snprintf(target_str, sizeof(target_str), "%s/%s", e->ied, e->cb);
+            snprintf(s_sv_target_str, sizeof(s_sv_target_str), "%s/%s", e->ied, e->cb);
         }
         else if (e->sv_id[0] != '\0')
         {
-            strncpy(target_str, e->sv_id, sizeof(target_str) - 1);
+            strncpy(s_sv_target_str, e->sv_id, sizeof(s_sv_target_str) - 1);
+            s_sv_target_str[sizeof(s_sv_target_str) - 1] = '\0';
         }
 
         Security_AlertLog_t alert = {
-            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : HAL_GetTick(),
+            .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : now,
             .frame_timestamp_ms = e->frame_timestamp_ms,
             .protocol = SEC_PROTO_SV,
             .severity = e->severity,
@@ -389,7 +409,7 @@ static void emit_sv_event(const SV_Event_t *e)
             .dst_mac = e->dst_mac,
             .src_ip = NULL,
             .dst_ip = NULL,
-            .target = target_str[0] ? target_str : NULL,
+            .target = s_sv_target_str[0] ? s_sv_target_str : NULL,
             .app_id = e->app_id,
             .vlan_id = e->vlan_id,
             .conf_rev = e->conf_rev,
@@ -399,6 +419,49 @@ static void emit_sv_event(const SV_Event_t *e)
             .recommendation = NULL};
 
         Security_LogAlertToSD(&alert);
+    }
+    else
+    {
+        SystemConfig_t sys_cfg;
+        SystemConfig_Get(&sys_cfg);
+        uint32_t now = HAL_GetTick();
+        static uint32_t s_last_sv_normal_tick = 0;
+        if ((now - s_last_sv_normal_tick) >= sys_cfg.alerts.normal_traffic_log_interval_ms || s_last_sv_normal_tick == 0)
+        {
+            s_last_sv_normal_tick = now;
+
+            s_sv_target_str[0] = '\0';
+            if (e->ied[0] != '\0' || e->cb[0] != '\0')
+            {
+                snprintf(s_sv_target_str, sizeof(s_sv_target_str), "%s/%s", e->ied, e->cb);
+            }
+            else if (e->sv_id[0] != '\0')
+            {
+                strncpy(s_sv_target_str, e->sv_id, sizeof(s_sv_target_str) - 1);
+                s_sv_target_str[sizeof(s_sv_target_str) - 1] = '\0';
+            }
+
+            Security_AlertLog_t alert = {
+                .timestamp_ms = e->timestamp_ms ? e->timestamp_ms : now,
+                .frame_timestamp_ms = e->frame_timestamp_ms,
+                .protocol = SEC_PROTO_SV,
+                .severity = SEC_SEV_INFO,
+                .event_type = Sv_EventToString(e->type),
+                .src_mac = e->src_mac,
+                .dst_mac = e->dst_mac,
+                .src_ip = NULL,
+                .dst_ip = NULL,
+                .target = s_sv_target_str[0] ? s_sv_target_str : NULL,
+                .app_id = e->app_id,
+                .vlan_id = e->vlan_id,
+                .conf_rev = e->conf_rev,
+                .st_num = 0,
+                .sq_num = e->smp_cnt,
+                .details = "Normal SV traffic validated against active SCD baseline",
+                .recommendation = NULL};
+
+            Security_LogAlertToSD(&alert);
+        }
     }
 }
 
@@ -451,17 +514,16 @@ SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame)
 
     if (!parse_sv_frame(frame->data, frame->length, now_ms, &p))
     {
-        SV_Event_t e;
-        fill_sv_event_base(&e, &p, NULL);
-        e.type = SV_EVENT_MALFORMED_FRAME;
-        e.severity = SEC_SEV_HIGH;
+        fill_sv_event_base(&s_sv_event, &p, NULL);
+        s_sv_event.type = SV_EVENT_MALFORMED_FRAME;
+        s_sv_event.severity = SEC_SEV_HIGH;
         if (frame->length >= 12)
         {
-            memcpy(e.dst_mac, &frame->data[0], SCD_MAC_ADDR_LEN);
-            memcpy(e.src_mac, &frame->data[6], SCD_MAC_ADDR_LEN);
+            memcpy(s_sv_event.dst_mac, &frame->data[0], SCD_MAC_ADDR_LEN);
+            memcpy(s_sv_event.src_mac, &frame->data[6], SCD_MAC_ADDR_LEN);
         }
-        snprintf(e.details, sizeof(e.details), "Malformed SV frame (len=%u)", frame->length);
-        emit_sv_event(&e);
+        snprintf(s_sv_event.details, sizeof(s_sv_event.details), "Malformed SV frame (len=%u)", frame->length);
+        emit_sv_event(&s_sv_event);
         return SV_EVENT_MALFORMED_FRAME;
     }
 
@@ -472,12 +534,11 @@ SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame)
     if (cfg == NULL || state != SCD_CONFIG_STATE_READY || !cfg->isValid)
     {
         SCD_Config_Unlock();
-        SV_Event_t e;
-        fill_sv_event_base(&e, &p, NULL);
-        e.type = SV_EVENT_UNKNOWN_CONTROL_BLOCK;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "No active SCD configuration for SV");
-        emit_sv_event(&e);
+        fill_sv_event_base(&s_sv_event, &p, NULL);
+        s_sv_event.type = SV_EVENT_UNKNOWN_CONTROL_BLOCK;
+        s_sv_event.severity = SEC_SEV_HIGH;
+        snprintf(s_sv_event.details, sizeof(s_sv_event.details), "No active SCD configuration for SV");
+        emit_sv_event(&s_sv_event);
         return SV_EVENT_UNKNOWN_CONTROL_BLOCK;
     }
 
@@ -493,137 +554,152 @@ SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame)
     if (s == NULL || idx < 0 || idx >= SCD_MAX_SV)
     {
         SCD_Config_Unlock();
-        SV_Event_t e;
-        fill_sv_event_base(&e, &p, NULL);
-        e.type = SV_EVENT_UNKNOWN_CONTROL_BLOCK;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "Unknown SV CB (svID='%.48s' appid=0x%04X)",
+        fill_sv_event_base(&s_sv_event, &p, NULL);
+        s_sv_event.type = SV_EVENT_UNKNOWN_CONTROL_BLOCK;
+        s_sv_event.severity = SEC_SEV_HIGH;
+        snprintf(s_sv_event.details, sizeof(s_sv_event.details), "Unknown SV CB (svID='%.48s' appid=0x%04X)",
                  p.sv_id[0] ? p.sv_id : "-", p.app_id);
-        emit_sv_event(&e);
+        emit_sv_event(&s_sv_event);
         return SV_EVENT_UNKNOWN_CONTROL_BLOCK;
     }
 
-    SV_Event_t e;
-    fill_sv_event_base(&e, &p, s);
+    fill_sv_event_base(&s_sv_event, &p, s);
     SV_EventType_t result = SV_EVENT_ACCEPT;
 
-    if (memcmp(p.dst_mac, s->mac, SCD_MAC_ADDR_LEN) != 0)
+    SystemConfig_t sys_cfg;
+    SystemConfig_Get(&sys_cfg);
+
+    bool baseline_mismatch = false;
+    if (sys_cfg.sv.baseline_check_enabled)
     {
-        e.type = SV_EVENT_MAC_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV DST MAC %02X:%02X:%02X:%02X:%02X:%02X != %s",
-                 p.dst_mac[0], p.dst_mac[1], p.dst_mac[2],
-                 p.dst_mac[3], p.dst_mac[4], p.dst_mac[5], s->macStr);
-        result = SV_EVENT_MAC_MISMATCH;
+        if (memcmp(p.dst_mac, s->mac, SCD_MAC_ADDR_LEN) != 0)
+        {
+            s_sv_event.type = SV_EVENT_MAC_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV DST MAC %02X:%02X:%02X:%02X:%02X:%02X != %s",
+                     p.dst_mac[0], p.dst_mac[1], p.dst_mac[2],
+                     p.dst_mac[3], p.dst_mac[4], p.dst_mac[5], s->macStr);
+            result = SV_EVENT_MAC_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.app_id != s->appId)
+        {
+            s_sv_event.type = SV_EVENT_APPID_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV APPID 0x%04X != 0x%04X", p.app_id, s->appId);
+            result = SV_EVENT_APPID_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if ((s->vlanId > 0 && !p.is_vlan_tagged) ||
+                 (s->vlanId > 0 && p.vlan_id != s->vlanId) ||
+                 (s->vlanId == 0 && p.is_vlan_tagged))
+        {
+            s_sv_event.type = SV_EVENT_VLAN_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV VLAN %u != %u (tagged=%d)",
+                     p.vlan_id, s->vlanId, p.is_vlan_tagged);
+            result = SV_EVENT_VLAN_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.is_vlan_tagged && s->vlanId > 0 && p.vlan_priority != s->vlanPriority)
+        {
+            s_sv_event.type = SV_EVENT_VLAN_PRIORITY_MISMATCH;
+            s_sv_event.severity = SEC_SEV_WARNING;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV VLAN priority %u != %u",
+                     p.vlan_priority, s->vlanPriority);
+            result = SV_EVENT_VLAN_PRIORITY_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.sv_id[0] != '\0' && s->svId[0] != '\0' && strcmp(p.sv_id, s->svId) != 0)
+        {
+            s_sv_event.type = SV_EVENT_SVID_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV svID '%.40s' != '%.40s'", p.sv_id, s->svId);
+            result = SV_EVENT_SVID_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.conf_rev != s->confRev)
+        {
+            s_sv_event.type = SV_EVENT_CONFREV_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV confRev %lu != %lu",
+                     (unsigned long)p.conf_rev, (unsigned long)s->confRev);
+            result = SV_EVENT_CONFREV_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (s->nofASDU > 0 && p.no_asdu != s->nofASDU)
+        {
+            s_sv_event.type = SV_EVENT_NOFASDU_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV nofASDU %u != %u", p.no_asdu, s->nofASDU);
+            result = SV_EVENT_NOFASDU_MISMATCH;
+            baseline_mismatch = true;
+        }
+        else if (p.has_smp_rate && s->sampleRate > 0 && p.smp_rate != s->sampleRate)
+        {
+            s_sv_event.type = SV_EVENT_SAMPLERATE_MISMATCH;
+            s_sv_event.severity = SEC_SEV_HIGH;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV sampleRate %lu != %lu",
+                     (unsigned long)p.smp_rate, (unsigned long)s->sampleRate);
+            result = SV_EVENT_SAMPLERATE_MISMATCH;
+            baseline_mismatch = true;
+        }
     }
-    else if (p.app_id != s->appId)
-    {
-        e.type = SV_EVENT_APPID_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV APPID 0x%04X != 0x%04X", p.app_id, s->appId);
-        result = SV_EVENT_APPID_MISMATCH;
-    }
-    else if ((s->vlanId > 0 && !p.is_vlan_tagged) ||
-             (s->vlanId > 0 && p.vlan_id != s->vlanId) ||
-             (s->vlanId == 0 && p.is_vlan_tagged))
-    {
-        e.type = SV_EVENT_VLAN_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV VLAN %u != %u (tagged=%d)",
-                 p.vlan_id, s->vlanId, p.is_vlan_tagged);
-        result = SV_EVENT_VLAN_MISMATCH;
-    }
-    else if (p.is_vlan_tagged && s->vlanId > 0 && p.vlan_priority != s->vlanPriority)
-    {
-        e.type = SV_EVENT_VLAN_PRIORITY_MISMATCH;
-        e.severity = SEC_SEV_WARNING;
-        snprintf(e.details, sizeof(e.details), "SV VLAN priority %u != %u",
-                 p.vlan_priority, s->vlanPriority);
-        result = SV_EVENT_VLAN_PRIORITY_MISMATCH;
-    }
-    else if (p.sv_id[0] != '\0' && s->svId[0] != '\0' && strcmp(p.sv_id, s->svId) != 0)
-    {
-        e.type = SV_EVENT_SVID_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV svID '%.40s' != '%.40s'", p.sv_id, s->svId);
-        result = SV_EVENT_SVID_MISMATCH;
-    }
-    else if (p.conf_rev != s->confRev)
-    {
-        e.type = SV_EVENT_CONFREV_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV confRev %lu != %lu",
-                 (unsigned long)p.conf_rev, (unsigned long)s->confRev);
-        result = SV_EVENT_CONFREV_MISMATCH;
-    }
-    else if (s->nofASDU > 0 && p.no_asdu != s->nofASDU)
-    {
-        e.type = SV_EVENT_NOFASDU_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV nofASDU %u != %u", p.no_asdu, s->nofASDU);
-        result = SV_EVENT_NOFASDU_MISMATCH;
-    }
-    else if (p.has_smp_rate && s->sampleRate > 0 && p.smp_rate != s->sampleRate)
-    {
-        e.type = SV_EVENT_SAMPLERATE_MISMATCH;
-        e.severity = SEC_SEV_HIGH;
-        snprintf(e.details, sizeof(e.details), "SV sampleRate %lu != %lu",
-                 (unsigned long)p.smp_rate, (unsigned long)s->sampleRate);
-        result = SV_EVENT_SAMPLERATE_MISMATCH;
-    }
-    else
+
+    if (!baseline_mismatch)
     {
         SvStreamState_t *st = &g_sv_streams[idx];
-        uint32_t smp_rate = (s->sampleRate > 0) ? s->sampleRate : 4000;
+        uint32_t smp_rate = (s->sampleRate > 0) ? s->sampleRate : sys_cfg.sv.sample_rate_fallback;
         uint32_t expected_step = (p.no_asdu > 0) ? (uint32_t)p.no_asdu : 1;
+        uint32_t delta_rx_ms = (st->initialized && p.rx_ms >= st->last_rx_ms)
+                                   ? (p.rx_ms - st->last_rx_ms)
+                                   : (0xFFFFFFFF - st->last_rx_ms + p.rx_ms + 1);
 
-        if (st->initialized)
+        bool is_idle = (st->initialized && delta_rx_ms > sys_cfg.sv.idle_timeout_ms);
+        bool is_valid_restart = (!st->initialized || (is_idle && p.smp_cnt == 0) || (is_idle && p.smp_cnt > st->last_smp_cnt));
+
+        if (is_valid_restart || !sys_cfg.sv.smpcnt_check_enabled)
         {
-            if (p.smp_cnt == st->last_smp_cnt)
-            {
-                e.type = SV_EVENT_SMPCNT_DUPLICATE;
-                e.severity = SEC_SEV_WARNING;
-                snprintf(e.details, sizeof(e.details), "SV duplicate smpCnt %lu",
-                         (unsigned long)p.smp_cnt);
-                result = SV_EVENT_SMPCNT_DUPLICATE;
-            }
-            else if (p.smp_cnt < st->last_smp_cnt)
-            {
-                bool is_wrap_boundary = (st->last_smp_cnt + expected_step >= smp_rate);
-                uint32_t expected_wrap_cnt = (st->last_smp_cnt + expected_step) % smp_rate;
+            result = SV_EVENT_ACCEPT;
+        }
+        else if (p.smp_cnt == st->last_smp_cnt)
+        {
+            s_sv_event.type = SV_EVENT_SMPCNT_DUPLICATE;
+            s_sv_event.severity = SEC_SEV_WARNING;
+            snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV duplicate smpCnt %lu",
+                     (unsigned long)p.smp_cnt);
+            result = SV_EVENT_SMPCNT_DUPLICATE;
+        }
+        else
+        {
+            uint32_t forward_dist = (p.smp_cnt > st->last_smp_cnt)
+                                        ? (p.smp_cnt - st->last_smp_cnt)
+                                        : (smp_rate - st->last_smp_cnt + p.smp_cnt);
 
-                if (is_wrap_boundary && p.smp_cnt == expected_wrap_cnt)
-                {
-                    result = SV_EVENT_ACCEPT;
-                }
-                else if (is_wrap_boundary && p.smp_cnt > expected_wrap_cnt && p.smp_cnt < 100)
-                {
-                    e.type = SV_EVENT_SMPCNT_GAP;
-                    e.severity = SEC_SEV_WARNING;
-                    snprintf(e.details, sizeof(e.details), "SV smpCnt gap at wrap-around %lu -> %lu (expected %lu)",
-                             (unsigned long)st->last_smp_cnt, (unsigned long)p.smp_cnt, (unsigned long)expected_wrap_cnt);
-                    result = SV_EVENT_SMPCNT_GAP;
-                }
-                else
-                {
-                    e.type = SV_EVENT_SMPCNT_ROLLBACK;
-                    e.severity = SEC_SEV_HIGH;
-                    snprintf(e.details, sizeof(e.details), "SV smpCnt rollback %lu -> %lu (rate=%lu)",
-                             (unsigned long)st->last_smp_cnt, (unsigned long)p.smp_cnt, (unsigned long)smp_rate);
-                    result = SV_EVENT_SMPCNT_ROLLBACK;
-                }
+            uint32_t expected_cnt = (st->last_smp_cnt + expected_step) % smp_rate;
+
+            if (forward_dist == expected_step)
+            {
+                result = SV_EVENT_ACCEPT;
+            }
+            else if (forward_dist > expected_step && forward_dist <= sys_cfg.sv.wrap_boundary_tolerance)
+            {
+                s_sv_event.type = SV_EVENT_SMPCNT_GAP;
+                s_sv_event.severity = SEC_SEV_WARNING;
+                snprintf(s_sv_event.details, sizeof(s_sv_event.details),
+                         (p.smp_cnt < st->last_smp_cnt)
+                             ? "SV smpCnt gap at wrap-around %lu -> %lu (expected %lu)"
+                             : "SV smpCnt gap %lu -> %lu (expected %lu)",
+                         (unsigned long)st->last_smp_cnt, (unsigned long)p.smp_cnt, (unsigned long)expected_cnt);
+                result = SV_EVENT_SMPCNT_GAP;
             }
             else
             {
-                uint32_t step = p.smp_cnt - st->last_smp_cnt;
-                if (step > expected_step)
-                {
-                    e.type = SV_EVENT_SMPCNT_GAP;
-                    e.severity = SEC_SEV_WARNING;
-                    snprintf(e.details, sizeof(e.details), "SV smpCnt gap %lu -> %lu (expected %lu)",
-                             (unsigned long)st->last_smp_cnt, (unsigned long)p.smp_cnt, (unsigned long)(st->last_smp_cnt + expected_step));
-                    result = SV_EVENT_SMPCNT_GAP;
-                }
+                s_sv_event.type = SV_EVENT_SMPCNT_ROLLBACK;
+                s_sv_event.severity = SEC_SEV_HIGH;
+                snprintf(s_sv_event.details, sizeof(s_sv_event.details), "SV smpCnt rollback %lu -> %lu (rate=%lu)",
+                         (unsigned long)st->last_smp_cnt, (unsigned long)p.smp_cnt, (unsigned long)smp_rate);
+                result = SV_EVENT_SMPCNT_ROLLBACK;
             }
         }
 
@@ -633,8 +709,21 @@ SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame)
     }
 
     SCD_Config_Unlock();
-    emit_sv_event(&e);
+    emit_sv_event(&s_sv_event);
     return result;
+}
+
+static Sv_Stats_t s_sv_stats = {0};
+
+/**
+ * @brief Copies the current SV statistics to the provided structure.
+ */
+void Sv_GetStats(Sv_Stats_t *stats)
+{
+    if (stats != NULL)
+    {
+        *stats = s_sv_stats;
+    }
 }
 
 /**
@@ -662,10 +751,12 @@ void Sv_Enqueue(struct pbuf *p)
         return;
     }
 
+    s_sv_stats.frames_received++;
+
     Sv_Frame_t *frame = (Sv_Frame_t *)osPoolAlloc(SvPoolHandle);
     if (frame == NULL)
     {
-        printf("[SV] Pool alloc failed, dropping frame\n");
+        s_sv_stats.pool_alloc_failures++;
         return;
     }
 
@@ -674,7 +765,7 @@ void Sv_Enqueue(struct pbuf *p)
 
     if (osMessagePut(SVQueueHandle, (uint32_t)frame, 0) != osOK)
     {
-        printf("[SV] Queue full, dropping frame\n");
+        s_sv_stats.queue_sends_failed++;
         osPoolFree(SvPoolHandle, frame);
     }
 }
@@ -701,6 +792,7 @@ void Sv_Task(void const *argument)
             Sv_Frame_t *frame = (Sv_Frame_t *)evt.value.v;
             if (frame != NULL)
             {
+                s_sv_stats.frames_processed++;
                 Sv_IDS_Process(frame);
                 if (SvPoolHandle != NULL)
                 {
@@ -725,7 +817,7 @@ const char *Sv_EventToString(SV_EventType_t type)
     switch (type)
     {
     case SV_EVENT_ACCEPT:
-        return "SV_ACCEPT";
+        return "SV_TRAFFIC_NORMAL";
     case SV_EVENT_UNKNOWN_CONTROL_BLOCK:
         return "SV_UNKNOWN_CONTROL_BLOCK";
     case SV_EVENT_MAC_MISMATCH:

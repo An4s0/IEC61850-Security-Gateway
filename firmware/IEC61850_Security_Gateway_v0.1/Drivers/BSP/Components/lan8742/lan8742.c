@@ -225,9 +225,18 @@ int32_t LAN8742_StartAutoNego(lan8742_Object_t *pObj)
   uint32_t readval = 0;
   int32_t status = LAN8742_STATUS_OK;
 
+  /* Ensure all capabilities are advertised in ANAR (100FD, 100HD, 10FD, 10HD) */
+  if(pObj->IO.ReadReg(pObj->DevAddr, LAN8742_ANAR, &readval) >= 0)
+  {
+    readval |= (LAN8742_ANAR_100BASE_TX_FD | LAN8742_ANAR_100BASE_TX |
+                LAN8742_ANAR_10BASE_T_FD   | LAN8742_ANAR_10BASE_T   |
+                LAN8742_ANAR_SELECTOR_FIELD);
+    pObj->IO.WriteReg(pObj->DevAddr, LAN8742_ANAR, readval);
+  }
+
   if(pObj->IO.ReadReg(pObj->DevAddr, LAN8742_BCR, &readval) >= 0)
   {
-    readval |= LAN8742_BCR_AUTONEGO_EN;
+    readval |= (LAN8742_BCR_AUTONEGO_EN | LAN8742_BCR_RESTART_AUTONEGO);
 
     /* Apply configuration */
     if(pObj->IO.WriteReg(pObj->DevAddr, LAN8742_BCR, readval) < 0)

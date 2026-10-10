@@ -53,9 +53,20 @@ typedef struct
     char details[128];
 } GOOSE_Event_t;
 
+typedef struct
+{
+    uint32_t frames_received;
+    uint32_t frames_processed;
+    uint32_t pool_alloc_failures;
+    uint32_t queue_sends_failed;
+    uint32_t pool_peak_usage;
+    uint32_t queue_high_water;
+} Goose_Stats_t;
+
 void Goose_Init(void);
 void Goose_Enqueue(struct pbuf *p);
 void Goose_Task(void const *argument);
+void Goose_GetStats(Goose_Stats_t *stats);
 
 GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame);
 

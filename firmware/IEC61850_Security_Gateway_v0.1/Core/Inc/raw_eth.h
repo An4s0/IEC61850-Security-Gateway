@@ -2,7 +2,8 @@
 #define RAW_ETH_H
 
 #include "lwip/pbuf.h"
+#include <stdbool.h>
 
-void RawEth_Process(struct pbuf *p);
+bool RawEth_Process(struct pbuf *p);
 
 #endif /* RAW_ETH_H */
