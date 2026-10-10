@@ -3,16 +3,18 @@
 
 #include "cmsis_os.h"
 #include <stdint.h>
+#include <stdbool.h>
 
 #define SCD_CHUNK_SIZE 1024
-#define SCD_CHUNK_POOL_SIZE 8
+#define SCD_CHUNK_POOL_SIZE 6
 #define SCD_QUEUE_SIZE 8
 
 typedef enum
 {
     SCD_EVENT_START = 0,
     SCD_EVENT_DATA,
-    SCD_EVENT_END
+    SCD_EVENT_END,
+    SCD_EVENT_ABORT
 } SCD_EventType_t;
 
 typedef struct
@@ -24,8 +26,10 @@ typedef struct
 
 void SCD_Storage_Init(void);
 void SCD_Storage_Start(void);
-void SCD_Storage_Enqueue(const uint8_t *data, uint16_t length);
-void SCD_Storage_End(void);
+bool SCD_Storage_Enqueue(const uint8_t *data, uint16_t length);
+bool SCD_Storage_End(void);
+void SCD_Storage_End_Async(void); /* Non-blocking: safe to call from lwIP tcpip thread */
+void SCD_Storage_Abort(void);
 void SCD_Storage_Task(void const *argument);
 void SCD_Storage_Free(SCD_Chunk_t *chunk);
 
