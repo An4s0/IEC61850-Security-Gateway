@@ -3819,18 +3819,16 @@ FRESULT f_close (
 
 #if !_FS_READONLY
 	res = f_sync(fp);					/* Flush cached data */
-	if (res == FR_OK)
+#else
+	res = FR_OK;
 #endif
 	{
-		res = validate(&fp->obj, &fs);	/* Lock volume */
-		if (res == FR_OK) {
+		FRESULT vres = validate(&fp->obj, &fs);	/* Lock volume */
+		if (vres == FR_OK) {
 #if _FS_LOCK != 0
-			res = dec_lock(fp->obj.lockid);	/* Decrement file open counter */
-			if (res == FR_OK)
+			(void)dec_lock(fp->obj.lockid);	/* Decrement file open counter */
 #endif
-			{
-				fp->obj.fs = 0;			/* Invalidate file object */
-			}
+			fp->obj.fs = 0;			/* Invalidate file object */
 #if _FS_REENTRANT
 			unlock_fs(fs, FR_OK);		/* Unlock volume */
 #endif

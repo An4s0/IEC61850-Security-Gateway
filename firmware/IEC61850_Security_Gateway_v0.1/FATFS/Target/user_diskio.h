@@ -29,10 +29,23 @@
 /* USER CODE BEGIN 0 */
 
 /* Includes ------------------------------------------------------------------*/
+#include "ff_gen_drv.h"
+#include "diskio.h"
+
 /* Exported types ------------------------------------------------------------*/
 /* Exported constants --------------------------------------------------------*/
 /* Exported functions ------------------------------------------------------- */
 extern Diskio_drvTypeDef  USER_Driver;
+
+DSTATUS USER_initialize(BYTE pdrv);
+DSTATUS USER_status(BYTE pdrv);
+DRESULT USER_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count);
+#if _USE_WRITE == 1
+DRESULT USER_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count);
+#endif /* _USE_WRITE == 1 */
+#if _USE_IOCTL == 1
+DRESULT USER_ioctl(BYTE pdrv, BYTE cmd, void *buff);
+#endif /* _USE_IOCTL == 1 */
 
 /* USER CODE END 0 */
 
