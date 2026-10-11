@@ -230,14 +230,6 @@ static void emit_mms_event(const MMS_Event_t *e)
                     s_mms_suppressed_prints = 0;
                 }
                 s_last_mms_print_tick = now;
-
-                if (e->severity >= SEC_SEV_HIGH)
-                {
-                    printf("[IDS] %s | %s | %s -> %s:%u\r\n",
-                           Mms_EventToString(e->type),
-                           Security_SeverityToString(e->severity),
-                           e->src_ip, e->dst_ip, (unsigned int)e->dst_port);
-                }
             }
             else
             {

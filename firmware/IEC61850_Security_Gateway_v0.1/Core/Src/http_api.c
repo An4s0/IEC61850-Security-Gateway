@@ -611,7 +611,7 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         return;
     }
 
-    if (!Security_LockSD(1000))
+    if (!Security_LockSD(50))
     {
         release_alert_resp_buffer(buf_idx);
         const char *busy =

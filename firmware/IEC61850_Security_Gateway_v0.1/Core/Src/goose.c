@@ -370,17 +370,6 @@ static void emit_event(const GOOSE_Event_t *e)
                     s_goose_suppressed_prints = 0;
                 }
                 s_last_goose_print_tick = now;
-
-                if (e->severity >= SEC_SEV_HIGH)
-                {
-                    printf("[IDS] %s | %s | %02X:%02X:%02X:%02X:%02X:%02X -> %02X:%02X:%02X:%02X:%02X:%02X\r\n",
-                           Goose_EventToString(e->type),
-                           Security_SeverityToString(e->severity),
-                           e->src_mac[0], e->src_mac[1], e->src_mac[2],
-                           e->src_mac[3], e->src_mac[4], e->src_mac[5],
-                           e->dst_mac[0], e->dst_mac[1], e->dst_mac[2],
-                           e->dst_mac[3], e->dst_mac[4], e->dst_mac[5]);
-                }
             }
             else
             {
