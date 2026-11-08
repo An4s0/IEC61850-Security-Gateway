@@ -34,16 +34,11 @@ static char s_safe_details[160];
 static char s_safe_target[64];
 static char s_frame_ts_str[32];
 
-#define ALERT_AGGREGATION_WINDOW_MS 350
-#define ALERT_AGGREGATION_MAX_MS 1000
 #define ALERT_TRACK_SLOTS 32
 
 typedef struct
 {
     bool in_use;
-    uint32_t first_tick;
-    uint32_t last_tick;
-    uint32_t count;
     Security_Protocol_t protocol;
     Security_Severity_t severity;
     uint16_t app_id;
@@ -58,11 +53,12 @@ typedef struct
     char dst_str[24];
     char target[64];
     char details[128];
-} AlertAggregationSlot_t;
+} AlertSlot_t;
 
-static AlertAggregationSlot_t s_slots[ALERT_TRACK_SLOTS];
-static AlertAggregationSlot_t s_flush_slot;
+static AlertSlot_t s_slots[ALERT_TRACK_SLOTS];
+static AlertSlot_t s_flush_slot;
 static Security_Stats_t s_sec_stats = {0};
+#define SEC_STAT_INC(field) do { taskENTER_CRITICAL(); if (s_sec_stats.field != UINT32_MAX) s_sec_stats.field++; taskEXIT_CRITICAL(); } while (0)
 
 /**
  * @brief Scans the alerts log file on the SD card to build checkpoint index and sync counters.
@@ -266,15 +262,9 @@ void Security_GetStats(Security_Stats_t *stats)
         return;
     }
 
-    if (s_slots_mutex != NULL && osMutexWait(s_slots_mutex, 10) == osOK)
-    {
-        *stats = s_sec_stats;
-        osMutexRelease(s_slots_mutex);
-    }
-    else
-    {
-        *stats = s_sec_stats;
-    }
+    taskENTER_CRITICAL();
+    *stats = s_sec_stats;
+    taskEXIT_CRITICAL();
 }
 
 /**
@@ -354,23 +344,12 @@ static void format_uint64(uint64_t val, char *buf, size_t buf_size)
 }
 
 /**
- * @brief Formats a single aggregated alert slot into a JSON line string.
+ * @brief Formats a single alert slot into a JSON line string.
  */
-static int format_alert_json(const AlertAggregationSlot_t *slot, uint32_t alert_id, char *out_buf, size_t max_len)
+static int format_alert_json(const AlertSlot_t *slot, uint32_t alert_id, char *out_buf, size_t max_len)
 {
-    if (slot->count > 1)
-    {
-        char raw_details[160];
-        snprintf(raw_details, sizeof(raw_details), "%s (repeated %lu times)",
-                 slot->details[0] ? slot->details : "Anomaly detected",
-                 (unsigned long)slot->count);
-        escape_json_str(raw_details, s_safe_details, sizeof(s_safe_details));
-    }
-    else
-    {
-        escape_json_str(slot->details[0] ? slot->details : "Anomaly detected",
-                        s_safe_details, sizeof(s_safe_details));
-    }
+    escape_json_str(slot->details[0] ? slot->details : "Anomaly detected",
+                    s_safe_details, sizeof(s_safe_details));
     escape_json_str(slot->target[0] ? slot->target : "N/A", s_safe_target, sizeof(s_safe_target));
     format_uint64(slot->frame_timestamp_ms, s_frame_ts_str, sizeof(s_frame_ts_str));
 
@@ -396,10 +375,7 @@ static int format_alert_json(const AlertAggregationSlot_t *slot, uint32_t alert_
 }
 
 /**
- * @brief Fast non-blocking RAM aggregation of security events.
- *        Called directly by real-time packet processing tasks (SV, GOOSE, MMS).
- *        NEVER touches SD card, NEVER blocks on FatFS, NEVER calls printf!
- *        Executes in < 2 microseconds.
+ * @brief Enqueues one independent security event in RAM.
  * @param alert Pointer to alert log descriptor.
  * @return true if successfully recorded, false on error.
  */
@@ -419,13 +395,12 @@ bool Security_LogAlertToSD(const Security_AlertLog_t *alert)
         }
     }
 
-    if (osMutexWait(s_slots_mutex, 10) != osOK)
+    if (osMutexWait(s_slots_mutex, 0) != osOK)
     {
-        s_sec_stats.alerts_dropped++;
+        SEC_STAT_INC(alerts_dropped);
         return false;
     }
 
-    s_sec_stats.alerts_generated++;
     uint32_t now = HAL_GetTick();
     const char *ev_type = alert->event_type ? alert->event_type : "GENERIC";
 
@@ -462,71 +437,27 @@ bool Security_LogAlertToSD(const Security_AlertLog_t *alert)
 
     const char *target_str = alert->target ? alert->target : "N/A";
 
-    AlertAggregationSlot_t *slot = NULL;
-    AlertAggregationSlot_t *free_slot = NULL;
-    uint32_t oldest_age = 0;
-    int oldest_idx = -1;
-
+    AlertSlot_t *slot = NULL;
+    AlertSlot_t *free_slot = NULL;
     for (int i = 0; i < ALERT_TRACK_SLOTS; i++)
     {
-        if (s_slots[i].in_use)
-        {
-            if (s_slots[i].protocol == alert->protocol &&
-                s_slots[i].app_id == alert->app_id &&
-                strncmp(s_slots[i].event_type, ev_type, sizeof(s_slots[i].event_type) - 1) == 0 &&
-                strncmp(s_slots[i].src_str, cur_src_str, sizeof(s_slots[i].src_str) - 1) == 0 &&
-                strncmp(s_slots[i].target, target_str, sizeof(s_slots[i].target) - 1) == 0)
-            {
-                slot = &s_slots[i];
-                break;
-            }
-
-            uint32_t age = now - s_slots[i].last_tick;
-            if (age > oldest_age)
-            {
-                oldest_age = age;
-                oldest_idx = i;
-            }
-        }
-        else if (free_slot == NULL)
+        if (!s_slots[i].in_use)
         {
             free_slot = &s_slots[i];
+            break;
         }
     }
-
-    if (slot != NULL)
+    if (free_slot == NULL)
     {
-        slot->count++;
-        slot->last_tick = now;
-        slot->sq_num = alert->sq_num;
-        slot->st_num = alert->st_num;
+        SEC_STAT_INC(alerts_dropped);
         osMutexRelease(s_slots_mutex);
-        return true;
-    }
-
-    if (free_slot == NULL && oldest_idx >= 0)
-    {
-        uint32_t age = now - s_slots[oldest_idx].last_tick;
-        if (age >= ALERT_AGGREGATION_WINDOW_MS || (now - s_slots[oldest_idx].first_tick) >= ALERT_AGGREGATION_MAX_MS)
-        {
-            free_slot = &s_slots[oldest_idx];
-            free_slot->in_use = false;
-        }
-        else
-        {
-            s_sec_stats.alerts_dropped++;
-            osMutexRelease(s_slots_mutex);
-            return false;
-        }
+        return false;
     }
 
     if (free_slot != NULL)
     {
         slot = free_slot;
         slot->in_use = true;
-        slot->first_tick = now;
-        slot->last_tick = now;
-        slot->count = 1;
         slot->protocol = alert->protocol;
         slot->severity = alert->severity;
         slot->app_id = alert->app_id;
@@ -547,11 +478,12 @@ bool Security_LogAlertToSD(const Security_AlertLog_t *alert)
         strncpy(slot->details, alert->details ? alert->details : "Anomaly detected", sizeof(slot->details) - 1);
         slot->details[sizeof(slot->details) - 1] = '\0';
 
+        SEC_STAT_INC(alerts_generated);
+        taskENTER_CRITICAL();
         s_sec_stats.slots_in_use++;
         if (s_sec_stats.slots_in_use > s_sec_stats.slots_high_water)
-        {
             s_sec_stats.slots_high_water = s_sec_stats.slots_in_use;
-        }
+        taskEXIT_CRITICAL();
     }
 
     osMutexRelease(s_slots_mutex);
@@ -559,7 +491,7 @@ bool Security_LogAlertToSD(const Security_AlertLog_t *alert)
 }
 
 /**
- * @brief Periodically flushes pending aggregated alert records to SD and SSE.
+ * @brief Periodically flushes pending alert records to SD and SSE.
  *        Executes in low-priority background task (defaultTask).
  *        Preemptible by high-priority real-time packet tasks (SV, GOOSE, MMS).
  */
@@ -578,34 +510,25 @@ void Security_PeriodicFlush(void)
     if (!s_counter_initialized)
     {
         sync_last_alert_id_from_sd();
+        if (!s_counter_initialized)
+        {
+            SEC_STAT_INC(storage_errors);
+            osMutexRelease(s_sd_file_mutex);
+            return;
+        }
     }
 
     uint32_t now = HAL_GetTick();
 
     SystemConfig_t sys_cfg;
     SystemConfig_Get(&sys_cfg);
-    uint32_t window_ms = (sys_cfg.alerts.alert_aggregation_window_ms > 0) ? sys_cfg.alerts.alert_aggregation_window_ms : 350;
-    uint32_t max_ms = (sys_cfg.alerts.alert_aggregation_max_ms > 0) ? sys_cfg.alerts.alert_aggregation_max_ms : 1000;
-
-    bool has_expired = false;
-    if (osMutexWait(s_slots_mutex, 10) == osOK)
+    bool pending = false;
+    if (osMutexWait(s_slots_mutex, 0) == osOK)
     {
-        for (int i = 0; i < ALERT_TRACK_SLOTS; i++)
-        {
-            if (s_slots[i].in_use && s_slots[i].count > 0)
-            {
-                if ((now - s_slots[i].last_tick >= window_ms) ||
-                    (now - s_slots[i].first_tick >= max_ms))
-                {
-                    has_expired = true;
-                    break;
-                }
-            }
-        }
+        pending = s_sec_stats.slots_in_use != 0;
         osMutexRelease(s_slots_mutex);
     }
-
-    if (!has_expired)
+    if (!pending)
     {
         osMutexRelease(s_sd_file_mutex);
         return;
@@ -619,7 +542,7 @@ void Security_PeriodicFlush(void)
         file_open = (res == FR_OK);
         if (!file_open)
         {
-            s_sec_stats.storage_errors++;
+            SEC_STAT_INC(storage_errors);
             static uint32_t s_last_sd_open_err_tick = 0;
             if ((now - s_last_sd_open_err_tick) >= 3000)
             {
@@ -640,21 +563,16 @@ void Security_PeriodicFlush(void)
         {
             for (int i = 0; i < ALERT_TRACK_SLOTS; i++)
             {
-                if (s_slots[i].in_use && s_slots[i].count > 0)
+                if (s_slots[i].in_use)
                 {
-                    if ((now - s_slots[i].last_tick >= window_ms) ||
-                        (now - s_slots[i].first_tick >= max_ms))
-                    {
-                        s_flush_slot = s_slots[i];
-                        s_slots[i].in_use = false;
-                        s_slots[i].count = 0;
-                        if (s_sec_stats.slots_in_use > 0)
-                        {
-                            s_sec_stats.slots_in_use--;
-                        }
-                        found_one = true;
-                        break;
-                    }
+                    s_flush_slot = s_slots[i];
+                    s_slots[i].in_use = false;
+                    taskENTER_CRITICAL();
+                    if (s_sec_stats.slots_in_use > 0)
+                        s_sec_stats.slots_in_use--;
+                    taskEXIT_CRITICAL();
+                    found_one = true;
+                    break;
                 }
             }
             osMutexRelease(s_slots_mutex);
@@ -665,25 +583,13 @@ void Security_PeriodicFlush(void)
             break;
         }
 
+        if (s_alert_counter == UINT32_MAX)
+        {
+            SEC_STAT_INC(alerts_dropped);
+            break;
+        }
         s_alert_counter++;
-        s_alert_record_count++;
-
-        if (s_flush_slot.protocol == SEC_PROTO_GOOSE)
-            s_total_goose++;
-        else if (s_flush_slot.protocol == SEC_PROTO_SV)
-            s_total_sv++;
-        else if (s_flush_slot.protocol == SEC_PROTO_MMS)
-            s_total_mms++;
-
-        if (s_flush_slot.severity == SEC_SEV_CRITICAL)
-            s_total_crit++;
-        else if (s_flush_slot.severity == SEC_SEV_HIGH)
-            s_total_high++;
-        else if (s_flush_slot.severity == SEC_SEV_WARNING)
-            s_total_warn++;
-        else if (s_flush_slot.severity == SEC_SEV_INFO)
-            s_total_info++;
-
+        bool persisted = false;
         int line_len = format_alert_json(&s_flush_slot, s_alert_counter, s_json_line, sizeof(s_json_line));
 
         if (line_len > 0 && (size_t)line_len < sizeof(s_json_line))
@@ -693,13 +599,31 @@ void Security_PeriodicFlush(void)
 
                 UINT bytes_written = 0;
                 FRESULT wr = f_write(&s_sd_file, s_json_line, (UINT)line_len, &bytes_written);
-                if (wr == FR_OK && bytes_written == (UINT)line_len)
+                if (wr == FR_OK && bytes_written == (UINT)line_len && f_sync(&s_sd_file) == FR_OK)
                 {
-                    s_sec_stats.alerts_written++;
+                    s_alert_record_count++;
+
+                    if (s_flush_slot.protocol == SEC_PROTO_GOOSE)
+                        s_total_goose++;
+                    else if (s_flush_slot.protocol == SEC_PROTO_SV)
+                        s_total_sv++;
+                    else if (s_flush_slot.protocol == SEC_PROTO_MMS)
+                        s_total_mms++;
+
+                    if (s_flush_slot.severity == SEC_SEV_CRITICAL)
+                        s_total_crit++;
+                    else if (s_flush_slot.severity == SEC_SEV_HIGH)
+                        s_total_high++;
+                    else if (s_flush_slot.severity == SEC_SEV_WARNING)
+                        s_total_warn++;
+                    else if (s_flush_slot.severity == SEC_SEV_INFO)
+                        s_total_info++;
+                    SEC_STAT_INC(alerts_written);
+                    persisted = true;
                 }
                 else
                 {
-                    s_sec_stats.storage_errors++;
+                    SEC_STAT_INC(storage_errors);
                     static uint32_t s_last_sd_wr_err_tick = 0;
                     if ((now - s_last_sd_wr_err_tick) >= 3000)
                     {
@@ -709,14 +633,16 @@ void Security_PeriodicFlush(void)
                 }
             }
 
-            HTTP_API_BroadcastAlert(s_json_line, (uint16_t)line_len);
+            if (persisted)
+                HTTP_API_BroadcastAlert(s_json_line, (uint16_t)line_len);
             num_flushed++;
         }
     }
 
     if (file_open)
     {
-        f_close(&s_sd_file);
+        if (f_close(&s_sd_file) != FR_OK)
+            SEC_STAT_INC(storage_errors);
         memset(&s_sd_file, 0, sizeof(s_sd_file));
     }
 
@@ -724,7 +650,7 @@ void Security_PeriodicFlush(void)
 }
 
 /**
- * @brief Clears the alerts log file on the SD card and resets the alert counter to 0.
+ * @brief Clears the alert history on the SD card.
  */
 bool Security_ClearAlertsOnSD(void)
 {
@@ -733,20 +659,11 @@ bool Security_ClearAlertsOnSD(void)
         Security_Init();
     }
 
-    if (s_slots_mutex != NULL)
-    {
-        osMutexWait(s_slots_mutex, 100);
-        memset(s_slots, 0, sizeof(s_slots));
-        s_sec_stats.slots_in_use = 0;
-        osMutexRelease(s_slots_mutex);
-    }
-
     if (s_sd_file_mutex != NULL)
     {
         osMutexWait(s_sd_file_mutex, osWaitForever);
     }
 
-    s_alert_counter = 0;
     s_alert_record_count = 0;
     s_total_goose = 0;
     s_total_sv = 0;

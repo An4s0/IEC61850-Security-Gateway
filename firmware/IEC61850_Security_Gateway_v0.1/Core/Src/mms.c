@@ -1,3 +1,4 @@
+#include "raw_eth.h"
 #include "mms.h"
 #include "main.h"
 #include "system_config.h"
@@ -368,6 +369,7 @@ MMS_EventType_t Mms_IDS_Process(const Mms_Frame_t *frame)
 
     if (!parse_mms_frame(frame->data, frame->length, now_ms, &p))
     {
+        Accounting_Increment(ACCOUNT_MMS, ACCOUNT_PARSE_FAILED);
         memset(&s_mms_event, 0, sizeof(s_mms_event));
         s_mms_event.type = MMS_EVENT_MALFORMED_FRAME;
         s_mms_event.severity = SEC_SEV_HIGH;
@@ -376,6 +378,8 @@ MMS_EventType_t Mms_IDS_Process(const Mms_Frame_t *frame)
         emit_mms_event(&s_mms_event);
         return MMS_EVENT_MALFORMED_FRAME;
     }
+
+    Accounting_Increment(ACCOUNT_MMS, ACCOUNT_PARSED);
 
     SCD_Config_Lock();
     const SCD_Config_t *cfg = SCD_Config_GetActive();
@@ -483,20 +487,29 @@ void Mms_Enqueue(struct pbuf *p)
 {
     if (p == NULL || MmsPoolHandle == NULL || p->tot_len > MMS_MAX_FRAME_SIZE)
     {
+        if (p != NULL) Accounting_Increment(ACCOUNT_MMS, ACCOUNT_DROP_SIZE_OR_INIT);
         return;
     }
 
     Mms_Frame_t *frame = (Mms_Frame_t *)osPoolAlloc(MmsPoolHandle);
     if (frame == NULL)
     {
+        Accounting_Increment(ACCOUNT_MMS, ACCOUNT_DROP_POOL);
         return;
     }
 
     frame->rx_timestamp_ms = HAL_GetTick();
     frame->length = pbuf_copy_partial(p, frame->data, p->tot_len, 0);
+    if (frame->length != p->tot_len)
+    {
+        Accounting_Increment(ACCOUNT_MMS, ACCOUNT_DROP_SIZE_OR_INIT);
+        osPoolFree(MmsPoolHandle, frame);
+        return;
+    }
 
     if (osMessagePut(MMSQueueHandle, (uint32_t)frame, 0) != osOK)
     {
+        Accounting_Increment(ACCOUNT_MMS, ACCOUNT_DROP_QUEUE);
         osPoolFree(MmsPoolHandle, frame);
     }
 }

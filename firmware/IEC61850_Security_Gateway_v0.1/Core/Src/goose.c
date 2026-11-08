@@ -1,3 +1,4 @@
+#include "raw_eth.h"
 #include "goose.h"
 #include "main.h"
 #include "system_config.h"
@@ -17,6 +18,8 @@ typedef struct
     uint32_t last_st_num;
     uint32_t last_sq_num;
     uint32_t last_rx_ms;
+    uint64_t last_rx_ticks;
+    bool last_rx_valid;
     uint32_t last_ttl_ms;
 } StreamState_t;
 
@@ -406,13 +409,8 @@ static void emit_event(const GOOSE_Event_t *e)
     }
     else
     {
-        SystemConfig_t sys_cfg;
-        SystemConfig_Get(&sys_cfg);
         uint32_t now = HAL_GetTick();
-        static uint32_t s_last_goose_normal_tick = 0;
-        if ((now - s_last_goose_normal_tick) >= sys_cfg.alerts.normal_traffic_log_interval_ms || s_last_goose_normal_tick == 0)
         {
-            s_last_goose_normal_tick = now;
             s_goose_target_str[0] = '\0';
             if (e->ied[0] != '\0' || e->cb[0] != '\0')
             {
@@ -485,11 +483,19 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
         return GOOSE_EVENT_NONE;
     }
 
-    uint32_t now_ms = (frame->rx_timestamp_ms > 0) ? frame->rx_timestamp_ms : HAL_GetTick();
+    static bool rx_warning_reported = false;
+    if (!frame->rx_timestamp_valid && !rx_warning_reported)
+    {
+        SysLog_Print(SYSLOG_LEVEL_WARN, "GOOSE", "MAC RX timestamp unavailable; using millisecond software timing");
+        rx_warning_reported = true;
+    }
+    else if (frame->rx_timestamp_valid) rx_warning_reported = false;
+    uint32_t now_ms = frame->rx_timestamp_ms;
     ParsedGoose_t p;
 
     if (!parse_frame(frame->data, frame->length, now_ms, &p))
     {
+        Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_PARSE_FAILED);
         fill_event_base(&s_goose_event, &p, NULL);
         s_goose_event.type = GOOSE_EVENT_MALFORMED_FRAME;
         s_goose_event.severity = SEC_SEV_HIGH;
@@ -502,6 +508,8 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
         emit_event(&s_goose_event);
         return GOOSE_EVENT_MALFORMED_FRAME;
     }
+
+    Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_PARSED);
 
     SCD_Config_Lock();
     const SCD_Config_t *cfg = SCD_Config_GetActive();
@@ -610,6 +618,8 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
             st->last_st_num = p.st_num;
             st->last_sq_num = p.sq_num;
             st->last_rx_ms = p.rx_ms;
+            st->last_rx_ticks = frame->rx_timestamp_ticks;
+            st->last_rx_valid = frame->rx_timestamp_valid;
             st->last_ttl_ms = (p.time_allowed_to_live > 0) ? p.time_allowed_to_live : (max_time * ttl_mult);
             result = GOOSE_EVENT_ACCEPT;
         }
@@ -619,13 +629,18 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
                                  ? (p.rx_ms - st->last_rx_ms)
                                  : (0xFFFFFFFF - st->last_rx_ms + p.rx_ms + 1);
 
+            uint32_t hz = HAL_RCC_GetHCLKFreq();
+            bool hardware_timing = frame->rx_timestamp_valid && st->last_rx_valid && hz != 0U;
+            uint64_t elapsed_ticks = Goose_RxDelta(frame->rx_timestamp_ticks, st->last_rx_ticks);
+            if (hardware_timing) delta = Goose_RxElapsedMs(elapsed_ticks, hz);
+
             uint32_t ttl_ms = (st->last_ttl_ms > 0)
                                   ? st->last_ttl_ms
                                   : ((p.time_allowed_to_live > 0)
                                          ? p.time_allowed_to_live
                                          : (max_time * ttl_mult));
 
-            bool is_expired = (delta > ttl_ms);
+            bool is_expired = hardware_timing ? Goose_RxAfterMs(elapsed_ticks, hz, ttl_ms) : (delta > ttl_ms);
             bool is_valid_restart = (is_expired && p.sq_num == 0);
 
             if (p.st_num > st->last_st_num)
@@ -684,13 +699,23 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
                 }
                 else
                 {
-                    if (sys_cfg.goose.timing_check_enabled && (delta + 1) < min_time)
+                    bool is_fast = hardware_timing ? Goose_RxBeforeMs(elapsed_ticks, hz, min_time) :
+                                   (delta < min_time && min_time - delta > 1U);
+                    if (sys_cfg.goose.timing_check_enabled && is_fast)
                     {
                         s_goose_event.type = GOOSE_EVENT_TIMING_FAST;
                         s_goose_event.severity = SEC_SEV_WARNING;
-                        snprintf(s_goose_event.details, sizeof(s_goose_event.details),
-                                 "Fast: %lu ms < minTime %lu ms",
-                                 (unsigned long)delta, (unsigned long)min_time);
+                        if (hardware_timing)
+                        {
+                            uint64_t us = (elapsed_ticks / hz) * 1000000U + ((elapsed_ticks % hz) * 1000000U) / hz;
+                            snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                                     "Fast: %lu.%03lu ms < minTime %lu ms (MAC RX)",
+                                     (unsigned long)(us / 1000U), (unsigned long)(us % 1000U), (unsigned long)min_time);
+                        }
+                        else
+                            snprintf(s_goose_event.details, sizeof(s_goose_event.details),
+                                     "Fast: %lu ms < minTime %lu ms (software RX)",
+                                     (unsigned long)delta, (unsigned long)min_time);
                         result = GOOSE_EVENT_TIMING_FAST;
                     }
                     else if (sys_cfg.goose.timing_check_enabled && is_expired)
@@ -712,6 +737,8 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
             st->last_st_num = p.st_num;
             st->last_sq_num = p.sq_num;
             st->last_rx_ms = p.rx_ms;
+            st->last_rx_ticks = frame->rx_timestamp_ticks;
+            st->last_rx_valid = frame->rx_timestamp_valid;
             st->last_ttl_ms = (p.time_allowed_to_live > 0)
                                   ? p.time_allowed_to_live
                                   : (max_time * ttl_mult);
@@ -754,10 +781,11 @@ void Goose_Init(void)
  * @brief Copies raw packet data into a frame pool element and enqueues it for IDS processing.
  * @param p Pointer to lwIP packet buffer.
  */
-void Goose_Enqueue(struct pbuf *p)
+void Goose_Enqueue(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
 {
     if (p == NULL || GoosePoolHandle == NULL || p->tot_len > GOOSE_MAX_FRAME_SIZE)
     {
+        if (p != NULL) Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_DROP_SIZE_OR_INIT);
         return;
     }
 
@@ -766,15 +794,25 @@ void Goose_Enqueue(struct pbuf *p)
     Goose_Frame_t *frame = (Goose_Frame_t *)osPoolAlloc(GoosePoolHandle);
     if (frame == NULL)
     {
+        Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_DROP_POOL);
         s_goose_stats.pool_alloc_failures++;
         return;
     }
 
     frame->rx_timestamp_ms = HAL_GetTick();
+    frame->rx_timestamp_ticks = rx_ticks;
+    frame->rx_timestamp_valid = rx_valid;
     frame->length = pbuf_copy_partial(p, frame->data, p->tot_len, 0);
+    if (frame->length != p->tot_len)
+    {
+        Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_DROP_SIZE_OR_INIT);
+        osPoolFree(GoosePoolHandle, frame);
+        return;
+    }
 
     if (osMessagePut(GooseQueueHandle, (uint32_t)frame, 0) != osOK)
     {
+        Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_DROP_QUEUE);
         s_goose_stats.queue_sends_failed++;
         osPoolFree(GoosePoolHandle, frame);
     }

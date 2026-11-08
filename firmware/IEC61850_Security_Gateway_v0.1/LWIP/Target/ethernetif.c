@@ -134,6 +134,8 @@ ETH_HandleTypeDef heth;
 ETH_TxPacketConfig TxConfig;
 extern struct netif gnetif;
 static volatile uint8_t s_eth_good_pkt_received = 0;
+/* Local, unsynchronised MAC timestamp counter; one count per HCLK cycle. */
+static bool s_rx_clock_ready = false;
 
 /* Private function prototypes -----------------------------------------------*/
 static void ethernetif_input(void const *argument);
@@ -190,14 +192,14 @@ void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *handlerEth)
 }
 
 /* USER CODE BEGIN 4 */
-static bool RawEth_Input(struct pbuf *p)
+static bool RawEth_Input(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
 {
   if (p == NULL)
   {
     return false;
   }
 
-  return RawEth_Process(p);
+  return RawEth_Process(p, rx_ticks, rx_valid);
 }
 
 /* USER CODE END 4 */
@@ -230,6 +232,27 @@ static void low_level_init(struct netif *netif)
   /* USER CODE END MACADDRESS */
 
   hal_eth_init_status = HAL_ETH_Init(&heth);
+
+  /* The HAL uses enhanced descriptors. Binary rollover with STSSI=1
+   * makes the MAC's high/low timestamp a 63-bit HCLK cycle counter. */
+  if (hal_eth_init_status == HAL_OK && (heth.Instance->DMABMR & ETH_DMABMR_EDE))
+  {
+    SET_BIT(heth.Instance->MACIMR, ETH_MACIMR_TSTIM);
+    heth.Instance->PTPTSCR = ETH_PTPTSCR_TSE | ETH_PTPTSCR_TSSARFE;
+    heth.Instance->PTPSSIR = 1U;
+    heth.Instance->PTPTSHUR = 0U;
+    heth.Instance->PTPTSLUR = 0U;
+    SET_BIT(heth.Instance->PTPTSCR, ETH_PTPTSCR_TSSTI);
+    uint32_t timeout = 1000000U;
+    while ((heth.Instance->PTPTSCR & ETH_PTPTSCR_TSSTI) && --timeout) { }
+    if (timeout != 0U)
+    {
+      uint32_t initial = heth.Instance->PTPTSLR;
+      uint32_t running_timeout = 1000000U;
+      while (heth.Instance->PTPTSLR == initial && --running_timeout) { }
+      s_rx_clock_ready = running_timeout != 0U;
+    }
+  }
 
   /* USER CODE BEGIN ETH_MAC_FILTER */
   ETH_MACFilterConfigTypeDef FilterConfig = {0};
@@ -468,7 +491,13 @@ static void ethernetif_input(void const *argument)
         if (p != NULL)
         {
           /* USER CODE BEGIN RawEth Input */
-          if (RawEth_Input(p))
+          /* HAL_ETH_ReadData copied the last descriptor's timestamp before
+           * rebuilding it; attach it to this exact returned pbuf. */
+          uint32_t hi = heth.RxDescList.TimeStamp.TimeStampHigh;
+          uint32_t lo = heth.RxDescList.TimeStamp.TimeStampLow;
+          bool valid = s_rx_clock_ready && !(hi == UINT32_MAX && lo == UINT32_MAX) && !(lo & 0x80000000U);
+          uint64_t ticks = ((uint64_t)hi << 31) | lo;
+          if (RawEth_Input(p, ticks, valid))
           {
             pbuf_free(p);
           }

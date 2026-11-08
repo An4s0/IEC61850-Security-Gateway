@@ -1,3 +1,4 @@
+#include "raw_eth.h"
 #include "sv.h"
 #include "main.h"
 #include "system_config.h"
@@ -422,14 +423,8 @@ static void emit_sv_event(const SV_Event_t *e)
     }
     else
     {
-        SystemConfig_t sys_cfg;
-        SystemConfig_Get(&sys_cfg);
         uint32_t now = HAL_GetTick();
-        static uint32_t s_last_sv_normal_tick = 0;
-        if ((now - s_last_sv_normal_tick) >= sys_cfg.alerts.normal_traffic_log_interval_ms || s_last_sv_normal_tick == 0)
         {
-            s_last_sv_normal_tick = now;
-
             s_sv_target_str[0] = '\0';
             if (e->ied[0] != '\0' || e->cb[0] != '\0')
             {
@@ -514,6 +509,7 @@ SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame)
 
     if (!parse_sv_frame(frame->data, frame->length, now_ms, &p))
     {
+        Accounting_Increment(ACCOUNT_SV, ACCOUNT_PARSE_FAILED);
         fill_sv_event_base(&s_sv_event, &p, NULL);
         s_sv_event.type = SV_EVENT_MALFORMED_FRAME;
         s_sv_event.severity = SEC_SEV_HIGH;
@@ -526,6 +522,8 @@ SV_EventType_t Sv_IDS_Process(const Sv_Frame_t *frame)
         emit_sv_event(&s_sv_event);
         return SV_EVENT_MALFORMED_FRAME;
     }
+
+    Accounting_Increment(ACCOUNT_SV, ACCOUNT_PARSED);
 
     SCD_Config_Lock();
     const SCD_Config_t *cfg = SCD_Config_GetActive();
@@ -748,6 +746,7 @@ void Sv_Enqueue(struct pbuf *p)
 {
     if (p == NULL || SvPoolHandle == NULL || p->tot_len > SV_MAX_FRAME_SIZE)
     {
+        if (p != NULL) Accounting_Increment(ACCOUNT_SV, ACCOUNT_DROP_SIZE_OR_INIT);
         return;
     }
 
@@ -756,15 +755,23 @@ void Sv_Enqueue(struct pbuf *p)
     Sv_Frame_t *frame = (Sv_Frame_t *)osPoolAlloc(SvPoolHandle);
     if (frame == NULL)
     {
+        Accounting_Increment(ACCOUNT_SV, ACCOUNT_DROP_POOL);
         s_sv_stats.pool_alloc_failures++;
         return;
     }
 
     frame->rx_timestamp_ms = HAL_GetTick();
     frame->length = pbuf_copy_partial(p, frame->data, p->tot_len, 0);
+    if (frame->length != p->tot_len)
+    {
+        Accounting_Increment(ACCOUNT_SV, ACCOUNT_DROP_SIZE_OR_INIT);
+        osPoolFree(SvPoolHandle, frame);
+        return;
+    }
 
     if (osMessagePut(SVQueueHandle, (uint32_t)frame, 0) != osOK)
     {
+        Accounting_Increment(ACCOUNT_SV, ACCOUNT_DROP_QUEUE);
         s_sv_stats.queue_sends_failed++;
         osPoolFree(SvPoolHandle, frame);
     }

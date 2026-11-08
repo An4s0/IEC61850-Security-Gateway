@@ -5,11 +5,36 @@
 #include "system_config.h"
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
 
 #define RAW_ETH_TYPE_VLAN 0x8100
 #define RAW_ETH_TYPE_GOOSE 0x88B8
 #define RAW_ETH_TYPE_SV 0x88BA
 #define RAW_ETH_TYPE_IPV4 0x0800
+
+static PacketAccounting s_accounting;
+
+void Accounting_Increment(AccountProtocol protocol, AccountField field)
+{
+    taskENTER_CRITICAL();
+    if (s_accounting.values[protocol][field] != UINT32_MAX)
+        s_accounting.values[protocol][field]++;
+    else
+        s_accounting.saturated = 1;
+    if (field == ACCOUNT_PARSED)
+        s_accounting.last_parsed_ms = HAL_GetTick();
+    taskEXIT_CRITICAL();
+}
+
+void Accounting_Get(PacketAccounting *out)
+{
+    taskENTER_CRITICAL();
+    *out = s_accounting;
+    taskEXIT_CRITICAL();
+}
 
 /**
  * @brief Checks whether an IPv4 packet contains MMS traffic based on active configuration.
@@ -64,16 +89,20 @@ static inline bool is_mms_packet(struct pbuf *p, uint16_t ip_offset)
  * @return true if packet is a pure Layer-2 frame (SV or GOOSE) that should NOT be passed to lwIP;
  *         false if packet must continue through lwIP (IPv4/MMS, ARP, etc.).
  */
-bool RawEth_Process(struct pbuf *p)
+bool RawEth_Process(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
 {
-    if (p == NULL || p->tot_len < 14)
+    if (p == NULL)
+        return false;
+    if (p->tot_len < 14)
     {
+        Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
         return false;
     }
 
     uint8_t hdr[14];
     if (pbuf_copy_partial(p, hdr, 14, 0) != 14)
     {
+        Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
         return false;
     }
 
@@ -82,18 +111,23 @@ bool RawEth_Process(struct pbuf *p)
     switch (etype)
     {
     case RAW_ETH_TYPE_GOOSE:
-        Goose_Enqueue(p);
+        Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_RX);
+        Goose_Enqueue(p, rx_ticks, rx_valid);
         return true;
 
     case RAW_ETH_TYPE_SV:
+        Accounting_Increment(ACCOUNT_SV, ACCOUNT_RX);
         Sv_Enqueue(p);
         return true;
 
     case RAW_ETH_TYPE_IPV4:
         if (is_mms_packet(p, 14))
         {
+            Accounting_Increment(ACCOUNT_MMS, ACCOUNT_RX);
             Mms_Enqueue(p);
         }
+        else
+            Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
         return false;
 
     case RAW_ETH_TYPE_VLAN:
@@ -105,24 +139,29 @@ bool RawEth_Process(struct pbuf *p)
                 uint16_t inner_type = (uint16_t)((inner[0] << 8) | inner[1]);
                 if (inner_type == RAW_ETH_TYPE_GOOSE)
                 {
-                    Goose_Enqueue(p);
+                    Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_RX);
+                    Goose_Enqueue(p, rx_ticks, rx_valid);
                     return true;
                 }
                 else if (inner_type == RAW_ETH_TYPE_SV)
                 {
+                    Accounting_Increment(ACCOUNT_SV, ACCOUNT_RX);
                     Sv_Enqueue(p);
                     return true;
                 }
                 else if (inner_type == RAW_ETH_TYPE_IPV4 && is_mms_packet(p, 18))
                 {
+                    Accounting_Increment(ACCOUNT_MMS, ACCOUNT_RX);
                     Mms_Enqueue(p);
                     return false;
                 }
             }
         }
+        Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
         return false;
 
     default:
+        Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
         return false;
     }
 }

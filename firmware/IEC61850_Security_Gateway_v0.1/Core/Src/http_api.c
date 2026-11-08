@@ -1,3 +1,4 @@
+#include "raw_eth.h"
 #include "http_api.h"
 #include "scd_storage.h"
 #include "scd_config.h"
@@ -547,7 +548,41 @@ static void stream_alerts_response(struct tcp_pcb *pcb, HTTP_API_Client_t *clien
 }
 
 /**
- * @brief Handles GET /api/alerts (or /api/alerts/history) requests without pagination.
+ * @brief Handles GET /api/accounting requests.
+ */
+static void handle_get_accounting(struct tcp_pcb *pcb)
+{
+    PacketAccounting a;
+    Security_Stats_t health;
+    char body[1024], response[1280];
+    Accounting_Get(&a);
+    Security_GetStats(&health);
+    int n = snprintf(body, sizeof(body), "{\"protocols\":[");
+    for (int i = 0; i < ACCOUNT_PROTOCOLS && n > 0 && n < (int)sizeof(body); i++)
+    {
+        n += snprintf(body + n, sizeof(body) - (size_t)n,
+                      "%s{\"rx\":%lu,\"parsed\":%lu,\"parse_failed\":%lu,\"drop_size_or_init\":%lu,\"drop_pool\":%lu,\"drop_queue\":%lu}",
+                      i ? "," : "", (unsigned long)a.values[i][ACCOUNT_RX],
+                      (unsigned long)a.values[i][ACCOUNT_PARSED], (unsigned long)a.values[i][ACCOUNT_PARSE_FAILED],
+                      (unsigned long)a.values[i][ACCOUNT_DROP_SIZE_OR_INIT], (unsigned long)a.values[i][ACCOUNT_DROP_POOL],
+                      (unsigned long)a.values[i][ACCOUNT_DROP_QUEUE]);
+    }
+    if (n <= 0 || n >= (int)sizeof(body))
+        return;
+    n += snprintf(body + n, sizeof(body) - (size_t)n,
+                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":32}",
+                  (unsigned long)a.saturated, (unsigned long)a.last_parsed_ms, (unsigned long)health.alerts_generated,
+                  (unsigned long)health.alerts_written, (unsigned long)health.alerts_dropped, (unsigned long)health.storage_errors,
+                  (unsigned long)health.slots_in_use, (unsigned long)health.slots_high_water);
+    if (n <= 0 || n >= (int)sizeof(body))
+        return;
+    int r = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", n, body);
+    if (r > 0 && r < (int)sizeof(response))
+        send_response(pcb, response);
+}
+
+/**
+ * @brief Handles GET /api/alerts and /api/alerts/history requests.
  */
 static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -557,7 +592,19 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         return;
     }
 
-    Security_PeriodicFlush();
+    unsigned long offset = 0, limit = 40;
+    const char *query = strchr(client->request, '?');
+    if (query != NULL)
+    {
+        const char *v = strstr(query, "offset=");
+        if (v != NULL)
+            (void)sscanf(v + 7, "%lu", &offset);
+        v = strstr(query, "limit=");
+        if (v != NULL)
+            (void)sscanf(v + 6, "%lu", &limit);
+    }
+    if (limit == 0 || limit > 40)
+        limit = 40;
 
     uint32_t total = Security_GetAlertCount();
     uint32_t tot = 0, goose = 0, sv = 0, mms = 0;
@@ -665,9 +712,9 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
                                (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
                                (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info);
 
-    static char temp_line[384];
-    uint32_t records_read = 0;
-    while ((ALERT_RESP_BUF_SIZE - 256 - body_offset) > 400)
+    static char temp_line[512];
+    uint32_t records_read = 0, records_seen = 0;
+    while (records_read < limit && (ALERT_RESP_BUF_SIZE - 256 - body_offset) > 520)
     {
         if (f_gets(temp_line, sizeof(temp_line), &file) == NULL)
         {
@@ -685,6 +732,8 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
             continue;
         }
 
+        if (records_seen++ < offset)
+            continue;
         if (records_read > 0)
         {
             body_start[body_offset++] = ',';
@@ -980,6 +1029,15 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
                 "\r\n";
 
             send_response(pcb, response);
+            pbuf_free(p);
+            api_close_conn(pcb, client);
+            return ERR_OK;
+        }
+
+        if (strncmp(client->request, "GET /api/accounting", 19) == 0)
+        {
+            tcp_recved(pcb, p->tot_len);
+            handle_get_accounting(pcb);
             pbuf_free(p);
             api_close_conn(pcb, client);
             return ERR_OK;
