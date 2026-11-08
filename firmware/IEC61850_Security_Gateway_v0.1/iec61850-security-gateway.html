@@ -294,6 +294,67 @@
         letter-spacing: 0.1em;
       }
 
+      .accounting-section {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .accounting-table-wrap {
+        border: 1px solid var(--lavender-line);
+        border-radius: 4px;
+        overflow: hidden;
+      }
+
+      .accounting-table th:not(:first-child),
+      .accounting-table td:not(:first-child) {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .accounting-table tbody tr:last-child td {
+        border-bottom: 0;
+        background: var(--lavender);
+        font-weight: 600;
+      }
+
+      .accounting-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .accounting-metrics .stat-tile { min-width: 0; }
+      .accounting-metrics .stat-value { font-size: 14px; overflow-wrap: anywhere; }
+      .accounting-status { color: var(--slate-soft); font-size: 10.5px; }
+
+      @media (max-width: 580px) {
+        .accounting-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .accounting-table thead { display: none; }
+        .accounting-table, .accounting-table tbody, .accounting-table tr { display: block; }
+        .accounting-table tbody tr {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 4px 12px;
+          padding: 8px 12px;
+          border-bottom: 1px solid var(--lavender-line);
+        }
+        .accounting-table tbody td {
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+          padding: 2px 0;
+          border: 0;
+        }
+        .accounting-table tbody td:first-child { grid-column: 1 / -1; font-weight: 600; }
+        .accounting-table tbody td:not(:first-child)::before {
+          content: attr(data-label);
+          color: var(--slate-soft);
+          font-size: 10px;
+          text-align: left;
+        }
+      }
+
       .scd-row {
         display: flex;
         align-items: stretch;
@@ -1609,6 +1670,27 @@
             </div>
           </div>
 
+          <section class="accounting-section" aria-labelledby="accounting-heading">
+            <div class="card-head">
+              <div><h2 id="accounting-heading">Packet Accounting</h2><p>Since boot · RX delivered by driver</p></div>
+            </div>
+            <div class="accounting-table-wrap">
+              <table class="console-table accounting-table">
+                <thead><tr><th scope="col">Protocol</th><th scope="col">RX</th><th scope="col">Parsed</th><th scope="col">Parse Failed</th><th scope="col">Inspection Drops</th></tr></thead>
+                <tbody id="packet-accounting"><tr><td colspan="5">Unavailable</td></tr></tbody>
+              </table>
+            </div>
+            <div class="accounting-metrics">
+              <div class="stat-tile"><div class="stat-label">RAM Records</div><div class="stat-value" id="packet-ram">—</div></div>
+              <div class="stat-tile"><div class="stat-label">SD Synced</div><div class="stat-value" id="packet-synced">—</div></div>
+              <div class="stat-tile"><div class="stat-label">Queue</div><div class="stat-value" id="packet-queue">—</div></div>
+              <div class="stat-tile"><div class="stat-label">Queue Failures</div><div class="stat-value" id="packet-failures">—</div></div>
+              <div class="stat-tile"><div class="stat-label">Storage Errors</div><div class="stat-value" id="packet-errors">—</div></div>
+              <div class="stat-tile"><div class="stat-label">Last Parsed Boot Time</div><div class="stat-value" id="packet-last">—</div></div>
+            </div>
+            <p id="packet-health" class="accounting-status" role="status">Waiting for gateway</p>
+          </section>
+
           <div class="card-head" style="margin-bottom: 2px">
             <div>
               <h2>SCD Configuration</h2>
@@ -2778,7 +2860,7 @@
                 </td>
               </tr>
 
-              <tr data-category="ALERTS">
+              <tr data-category="ALERTS" style="display:none">
                 <td><span class="proto-badge badge-alerts">ALERTS</span></td>
                 <td><strong>Burst Aggregation Window</strong></td>
                 <td>
@@ -2803,7 +2885,7 @@
                   </div>
                 </td>
               </tr>
-              <tr data-category="ALERTS">
+              <tr data-category="ALERTS" style="display:none">
                 <td><span class="proto-badge badge-alerts">ALERTS</span></td>
                 <td><strong>Max Aggregation Period</strong></td>
                 <td>
@@ -2853,7 +2935,7 @@
                   </div>
                 </td>
               </tr>
-              <tr data-category="ALERTS">
+              <tr data-category="ALERTS" style="display:none">
                 <td><span class="proto-badge badge-alerts">ALERTS</span></td>
                 <td><strong>Normal Traffic Heartbeat Throttle</strong></td>
                 <td>
@@ -4286,6 +4368,36 @@
         };
       }
 
+      async function refreshPacketAccounting() {
+        const table = document.getElementById("packet-accounting");
+        const health = document.getElementById("packet-health");
+        try {
+          const response = await fetch(getApiEndpoint("/api/accounting"), { cache: "no-store" });
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          const data = await response.json();
+          const rows = data.protocols;
+          const names = ["GOOSE", "SV", "MMS", "Other"];
+          const totals = {rx:0, parsed:0, parse_failed:0, drop_size_or_init:0, drop_pool:0, drop_queue:0};
+          for (const row of rows) for (const key of Object.keys(totals)) totals[key] += row[key];
+          const line = (name, r) => `<tr><td>${name}</td><td data-label="RX">${r.rx}</td><td data-label="Parsed">${r.parsed}</td><td data-label="Parse Failed">${r.parse_failed}</td><td data-label="Inspection Drops">${r.drop_size_or_init + r.drop_pool + r.drop_queue}</td></tr>`;
+          table.innerHTML = rows.map((r, i) => line(names[i], r)).join("") + line("Total", totals);
+          const set = (id, value) => { document.getElementById(id).textContent = value; };
+          set("packet-ram", data.alerts_created);
+          set("packet-synced", data.alerts_persisted);
+          set("packet-queue", `${data.queue_used} / ${data.queue_capacity}`);
+          set("packet-failures", data.alert_queue_failures);
+          set("packet-errors", data.storage_errors);
+          set("packet-last", `${data.last_parsed_ms} ms`);
+          health.textContent = data.saturated ? "Counter saturated" : "Counters are cumulative since boot";
+        } catch (error) {
+          health.textContent = "Processing health unavailable; values may be stale";
+        }
+      }
+      document.addEventListener("DOMContentLoaded", () => {
+        refreshPacketAccounting();
+        setInterval(refreshPacketAccounting, 5000);
+      });
+
       async function fetchAlertsFromGateway(isManual = false) {
         if (isFetchingAlerts && !isManual) return;
         isFetchingAlerts = true;
@@ -4304,6 +4416,7 @@
         try {
           const response = await fetch(apiUrl, {
             method: "GET",
+            cache: "no-store",
             headers: {
               Accept: "application/json, text/plain, */*",
             },
@@ -4350,6 +4463,18 @@
             }
           }
 
+          // Read a stable prefix: newly appended records are delivered by SSE or the next refresh.
+          if (serverTotal !== null) {
+            const snapshotTotal = serverTotal;
+            while (parsedItems.length < snapshotTotal) {
+              const page = await fetch(`${apiUrl}?offset=${parsedItems.length}&limit=40`, { cache: "no-store" });
+              if (!page.ok) throw new Error("HTTP " + page.status);
+              const payload = await page.json();
+              if (!Array.isArray(payload.alerts) || payload.alerts.length === 0)
+                throw new Error("Alert history changed or could not be read");
+              parsedItems.push(...payload.alerts.slice(0, snapshotTotal - parsedItems.length));
+            }
+          }
           if (parsedItems.length > 0) {
             detectedAlerts = parsedItems.map(normalizeAlert).filter(Boolean);
             detectedAlerts.sort((a, b) => {
@@ -4464,12 +4589,11 @@
           if (item && typeof item === "object") {
             const newAlert = normalizeAlert(item);
             if (newAlert) {
-              totalAlertsCount++;
-
               const existingIdx = detectedAlerts.findIndex(
                 (a) => a.id === newAlert.id,
               );
               if (existingIdx === -1) {
+                totalAlertsCount++;
                 detectedAlerts.unshift(newAlert);
                 renderAlertsTable();
                 updateMainViewStats();
