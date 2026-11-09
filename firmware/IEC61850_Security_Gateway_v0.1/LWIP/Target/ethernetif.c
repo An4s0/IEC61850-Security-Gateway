@@ -123,6 +123,9 @@ ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDesc
 #endif
 
 /* USER CODE BEGIN 2 */
+static volatile Ethernet_Diagnostics_t s_eth_diagnostics;
+
+#define ETH_DIAG_INC(field) do { if (s_eth_diagnostics.field != UINT32_MAX) s_eth_diagnostics.field++; } while (0)
 
 /* USER CODE END 2 */
 
@@ -185,13 +188,24 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *handlerEth)
  */
 void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *handlerEth)
 {
+  ETH_DIAG_INC(dma_error_callbacks);
   if ((HAL_ETH_GetDMAError(handlerEth) & ETH_DMASR_RBUS) == ETH_DMASR_RBUS)
   {
+    ETH_DIAG_INC(rx_buffer_unavailable);
     osSemaphoreRelease(RxPktSemaphore);
   }
 }
 
 /* USER CODE BEGIN 4 */
+void Ethernet_GetDiagnostics(Ethernet_Diagnostics_t *out)
+{
+  if (out == NULL)
+    return;
+  taskENTER_CRITICAL();
+  *out = s_eth_diagnostics;
+  taskEXIT_CRITICAL();
+}
+
 static bool RawEth_Input(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
 {
   if (p == NULL)
@@ -461,6 +475,7 @@ static struct pbuf *low_level_input(struct netif *netif)
   HAL_ETH_ReadData(&heth, (void **)&p);
   if (p != NULL)
   {
+    ETH_DIAG_INC(delivered);
     s_eth_good_pkt_received = 1;
   }
 
@@ -505,6 +520,7 @@ static void ethernetif_input(void const *argument)
           /* USER CODE END RawEth Input */
           if (netif->input(p, netif) != ERR_OK)
           {
+            ETH_DIAG_INC(lwip_input_failures);
             pbuf_free(p);
           }
         }
@@ -956,6 +972,7 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buff)
   }
   else
   {
+    ETH_DIAG_INC(rx_alloc_failures);
     RxAllocStatus = RX_ALLOC_ERROR;
     *buff = NULL;
   }

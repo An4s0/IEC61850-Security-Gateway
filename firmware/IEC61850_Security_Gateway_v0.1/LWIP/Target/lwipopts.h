@@ -115,6 +115,7 @@
 #define CHECKSUM_CHECK_ICMP6 0
 /*-----------------------------------------------------------------------------*/
 /* USER CODE BEGIN 1 */
+#undef LWIP_RAM_HEAP_POINTER
 /* Number of simultaneously active TCP connections (defaults to only 5 in opt.h).
  * Essential for modern browsers which open 4-6 parallel TCP sockets */
 #define MEMP_NUM_TCP_PCB                16

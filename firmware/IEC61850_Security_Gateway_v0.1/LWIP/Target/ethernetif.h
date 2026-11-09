@@ -39,6 +39,16 @@ u32_t sys_jiffies(void);
 u32_t sys_now(void);
 
 /* USER CODE BEGIN 1 */
+typedef struct
+{
+  uint32_t delivered;
+  uint32_t rx_alloc_failures;
+  uint32_t dma_error_callbacks;
+  uint32_t rx_buffer_unavailable;
+  uint32_t lwip_input_failures;
+} Ethernet_Diagnostics_t;
+
+void Ethernet_GetDiagnostics(Ethernet_Diagnostics_t *out);
 
 /* USER CODE END 1 */
 #endif
