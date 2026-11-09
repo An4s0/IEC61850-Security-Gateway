@@ -51,6 +51,9 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/mms.c
     Core/Src/security.c
     Core/Src/http_api.c
+    Core/Src/storage_service.c
+    Core/Src/runtime_stats.c
+    Core/Src/sys_diag.c
     Core/Src/scd_storage.c
     Core/Src/scd_config.c
     Core/Src/sdmmc.c

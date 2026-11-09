@@ -51,6 +51,11 @@ typedef struct
     uint32_t storage_errors;
     uint32_t slots_in_use;
     uint32_t slots_high_water;
+    uint32_t alerts_attempted;
+    uint32_t persistence_retries;
+    uint32_t alerts_dropped_buffer_full;
+    uint32_t alerts_dropped_mutex_busy;
+    uint32_t alerts_purged;
 } Security_Stats_t;
 
 void Security_Init(void);
@@ -60,7 +65,10 @@ const char *Security_ProtocolToString(Security_Protocol_t proto);
 bool Security_LogAlertToSD(const Security_AlertLog_t *alert);
 void Security_PeriodicFlush(void);
 bool Security_ClearAlertsOnSD(void);
+bool Security_HasPendingAlert(void);
+uint32_t Security_PurgePendingAlerts(void);
 uint32_t Security_GetAlertCount(void);
+bool Security_IsReady(void);
 void Security_GetStats(Security_Stats_t *stats);
 
 bool Security_LockSD(uint32_t timeout_ms);
