@@ -141,6 +141,11 @@ standard names. */
 #define INCLUDE_uxTaskGetStackHighWaterMark     1
 /* Enable task listing and runtime stats */
 #define configUSE_TRACE_FACILITY                1
+/* Per-task run-time counters, sourced from the free-running TIM7 (no interrupt) */
+#include "runtime_stats.h"
+#define configGENERATE_RUN_TIME_STATS           1
+#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() RunTimeStats_Init()
+#define portGET_RUN_TIME_COUNTER_VALUE()         RunTimeStats_GetCount()
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

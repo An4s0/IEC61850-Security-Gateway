@@ -227,6 +227,15 @@ SECTIONS
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );
 
+  /* Retained across resets: not initialised by the C startup code */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+  } >RAM
+
   /* Ethernet DMA descriptors */
   .RxDescripSection 0x2007C000 (NOLOAD) :
   {

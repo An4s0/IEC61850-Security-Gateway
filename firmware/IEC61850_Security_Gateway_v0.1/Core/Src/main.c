@@ -36,6 +36,8 @@
 #include "sdmmc.h"
 #include "system_config.h"
 #include "system_logger.h"
+#include "storage_service.h"
+#include "sys_diag.h"
 #include "lwip/tcpip.h"
 
 /* USER CODE END Includes */
@@ -121,7 +123,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  SysDiag_Init();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -401,6 +403,7 @@ void StartDefaultTask(void const *argument)
   SCD_Storage_Init();
   SCD_Config_Init();
   Security_Init();
+  StorageService_Init();
   Security_SyncAlertCounter();
 
   LOCK_TCPIP_CORE();
@@ -414,8 +417,7 @@ void StartDefaultTask(void const *argument)
   for (;;)
   {
     osDelay(100);
-    Security_PeriodicFlush();
-    SysLog_PeriodicFlush();
+    StorageService_Run();
   }
   /* USER CODE END 5 */
 }
