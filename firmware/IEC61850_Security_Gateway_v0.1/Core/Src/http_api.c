@@ -5,6 +5,11 @@
 #include "system_config.h"
 #include "system_logger.h"
 #include "security.h"
+#include "ethernetif.h"
+#include "sdmmc.h"
+#include "storage_service.h"
+#include "runtime_stats.h"
+#include "sys_diag.h"
 #include "fatfs.h"
 #include "ff.h"
 #include "lwip/tcp.h"
@@ -42,6 +47,8 @@ typedef struct HTTP_API_Client_s
     char *resp_buf;
     uint32_t resp_len;
     uint32_t resp_sent;
+    uint32_t gen;
+    struct StorageRequest_s *storage_req;
     struct tcp_pcb *pcb;
     struct HTTP_API_Client_s *next_sse;
 } HTTP_API_Client_t;
@@ -89,11 +96,17 @@ static SSE_Message_t s_alert_pool[MAX_ALERT_POOL];
 osMutexDef(AlertPoolMutex);
 static osMutexId s_alert_pool_mutex = NULL;
 
+static volatile uint32_t s_sse_delivered = 0;
+static volatile uint32_t s_sse_pool_exhausted = 0;
+static volatile uint32_t s_sse_post_failed = 0;
+static volatile uint32_t s_storage_callback_failures = 0;
+
 static void api_close_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
 static void api_abort_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
 static void stream_alerts_response(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
 static bool process_scd_data(struct tcp_pcb *pcb, HTTP_API_Client_t *client, const uint8_t *data, uint16_t len);
 static void finish_post(struct tcp_pcb *pcb, HTTP_API_Client_t *client);
+static void do_storage_complete(void *ctx);
 
 /**
  * @brief Allocates a client state slot from the static pool.
@@ -104,9 +117,12 @@ static HTTP_API_Client_t *alloc_client(struct tcp_pcb *pcb)
     {
         if (!s_clients[i].in_use)
         {
+            uint32_t gen = s_clients[i].gen + 1U;
             memset(&s_clients[i], 0, sizeof(HTTP_API_Client_t));
+            s_clients[i].gen = gen;
             s_clients[i].in_use = 1;
             s_clients[i].alert_buf_idx = -1;
+            s_clients[i].storage_req = NULL;
             s_clients[i].pcb = pcb;
             s_clients[i].last_activity = HAL_GetTick();
             return &s_clients[i];
@@ -117,6 +133,11 @@ static HTTP_API_Client_t *alloc_client(struct tcp_pcb *pcb)
 
 /**
  * @brief Releases a client state slot back to the static pool.
+ *
+ * An alert response buffer owned by an in-flight storage request is NOT
+ * released here: the request keeps ownership and the completion callback
+ * releases it. This prevents a recycled buffer being written by the storage
+ * task while another client is using it.
  */
 static void free_client(HTTP_API_Client_t *client)
 {
@@ -127,6 +148,7 @@ static void free_client(HTTP_API_Client_t *client)
             release_alert_resp_buffer(client->alert_buf_idx);
             client->alert_buf_idx = -1;
         }
+        client->storage_req = NULL;
         client->alerts_active = 0;
         client->in_use = 0;
         client->pcb = NULL;
@@ -404,42 +426,50 @@ static void handle_get_config(struct tcp_pcb *pcb)
 }
 
 /**
+ * @brief Queues a configuration persistence request for the storage owner.
+ *        The HTTP response is produced by do_storage_complete().
+ */
+static void submit_config_save(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
+{
+    StorageRequest_t *req = StorageService_Acquire();
+    if (req == NULL || !StorageService_Submit(req))
+    {
+        if (req != NULL)
+        {
+            StorageService_Release(req);
+        }
+        const char *err_resp =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 30\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"Storage is busy\"}";
+        send_response(pcb, err_resp);
+        api_close_conn(pcb, client);
+        return;
+    }
+
+    req->op = STORAGE_OP_CONFIG_SAVE;
+    req->ctx = client;
+    req->ctx_gen = client->gen;
+    req->buf_idx = -1;
+    client->storage_req = req;
+}
+
+/**
  * @brief Handles POST /api/config/reset requests and resets settings to factory defaults.
  */
-static void handle_reset_config(struct tcp_pcb *pcb)
+static void handle_reset_config(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
     SystemConfig_ResetToDefaults();
-    SystemConfig_SaveToSD();
-
-    SystemConfig_t cfg;
-    SystemConfig_Get(&cfg);
-
-    int body_len = SystemConfig_ToJson(&cfg, s_config_json_body, sizeof(s_config_json_body));
-    if (body_len < 0)
-    {
-        body_len = 0;
-    }
-
-    int resp_len = snprintf(s_config_response, sizeof(s_config_response),
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: application/json\r\n"
-                            "Access-Control-Allow-Origin: *\r\n"
-                            "Content-Length: %d\r\n"
-                            "Connection: close\r\n"
-                            "\r\n"
-                            "%s",
-                            body_len, s_config_json_body);
-
-    if (resp_len > 0)
-    {
-        send_response(pcb, s_config_response);
-    }
+    submit_config_save(pcb, client);
 }
 
 /**
  * @brief Handles POST /api/config requests, validates payload, applies settings, and saves to SD.
  */
-static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t body_len)
+static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t body_len, HTTP_API_Client_t *client)
 {
     (void)body_len;
     SystemConfig_t new_cfg;
@@ -455,6 +485,7 @@ static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t b
             "\r\n"
             "{\"error\":\"Invalid configuration parameters\"}";
         send_response(pcb, err_resp);
+        api_close_conn(pcb, client);
         return;
     }
 
@@ -469,31 +500,11 @@ static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t b
             "\r\n"
             "{\"error\":\"Validation failed on values\"}";
         send_response(pcb, err_resp);
+        api_close_conn(pcb, client);
         return;
     }
 
-    SystemConfig_SaveToSD();
-
-    int body_size = SystemConfig_ToJson(&new_cfg, s_config_json_body, sizeof(s_config_json_body));
-    if (body_size < 0)
-    {
-        body_size = 0;
-    }
-
-    int total_len = snprintf(s_config_response, sizeof(s_config_response),
-                             "HTTP/1.1 200 OK\r\n"
-                             "Content-Type: application/json\r\n"
-                             "Access-Control-Allow-Origin: *\r\n"
-                             "Content-Length: %d\r\n"
-                             "Connection: close\r\n"
-                             "\r\n"
-                             "%s",
-                             body_size, s_config_json_body);
-
-    if (total_len > 0)
-    {
-        send_response(pcb, s_config_response);
-    }
+    submit_config_save(pcb, client);
 }
 
 /**
@@ -554,9 +565,17 @@ static void handle_get_accounting(struct tcp_pcb *pcb)
 {
     PacketAccounting a;
     Security_Stats_t health;
-    char body[1024], response[1280];
+    Ethernet_Diagnostics_t ethernet;
+    SDMMC_Diagnostics_t sd;
+    StorageService_Stats_t storage;
+    SysDiag_Stats_t diag;
+    static char body[3072], response[3328];
     Accounting_Get(&a);
     Security_GetStats(&health);
+    Ethernet_GetDiagnostics(&ethernet);
+    SDMMC_GetDiagnostics(&sd);
+    StorageService_GetStats(&storage);
+    SysDiag_Get(&diag);
     int n = snprintf(body, sizeof(body), "{\"protocols\":[");
     for (int i = 0; i < ACCOUNT_PROTOCOLS && n > 0 && n < (int)sizeof(body); i++)
     {
@@ -570,15 +589,148 @@ static void handle_get_accounting(struct tcp_pcb *pcb)
     if (n <= 0 || n >= (int)sizeof(body))
         return;
     n += snprintf(body + n, sizeof(body) - (size_t)n,
-                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":32}",
+                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":32,\"alerts_attempted\":%lu,\"persistence_retries\":%lu,\"alerts_dropped_buffer_full\":%lu,\"alerts_dropped_mutex_busy\":%lu,\"alerts_purged\":%lu,\"driver_delivered\":%lu,\"rx_alloc_failures\":%lu,\"dma_error_callbacks\":%lu,\"rx_buffer_unavailable_events\":%lu,\"lwip_input_failures\":%lu,\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,\"task_count\":%lu,\"sd_read_failures\":%lu,\"sd_write_failures\":%lu,\"sd_write_retries\":%lu,\"sd_write_recovered\":%lu,\"sd_timeouts\":%lu,\"sd_max_write_ms\":%lu,\"sd_card_ready_timeouts\":%lu,\"sd_max_irq_off_us\":%lu,\"storage_submitted\":%lu,\"storage_ok\":%lu,\"storage_fail\":%lu,\"storage_queue_full\":%lu,\"storage_lock_timeouts\":%lu,\"storage_cb_failures\":%lu,\"sse_delivered\":%lu,\"sse_pool_exhausted\":%lu,\"sse_post_failed\":%lu,\"uptime_ms\":%lu,\"boot_count\":%lu,\"reset_flags\":%lu}",
                   (unsigned long)a.saturated, (unsigned long)a.last_parsed_ms, (unsigned long)health.alerts_generated,
                   (unsigned long)health.alerts_written, (unsigned long)health.alerts_dropped, (unsigned long)health.storage_errors,
-                  (unsigned long)health.slots_in_use, (unsigned long)health.slots_high_water);
+                  (unsigned long)health.slots_in_use, (unsigned long)health.slots_high_water,
+                  (unsigned long)health.alerts_attempted, (unsigned long)health.persistence_retries,
+                  (unsigned long)health.alerts_dropped_buffer_full, (unsigned long)health.alerts_dropped_mutex_busy,
+                  (unsigned long)health.alerts_purged,
+                  (unsigned long)ethernet.delivered, (unsigned long)ethernet.rx_alloc_failures,
+                  (unsigned long)ethernet.dma_error_callbacks, (unsigned long)ethernet.rx_buffer_unavailable,
+                  (unsigned long)ethernet.lwip_input_failures, (unsigned long)xPortGetFreeHeapSize(),
+                  (unsigned long)xPortGetMinimumEverFreeHeapSize(), (unsigned long)uxTaskGetNumberOfTasks(),
+                  (unsigned long)sd.read_failures, (unsigned long)sd.write_failures,
+                  (unsigned long)sd.write_retries, (unsigned long)sd.write_recovered,
+                  (unsigned long)sd.timeouts, (unsigned long)sd.max_write_ms,
+                  (unsigned long)sd.card_ready_timeouts, (unsigned long)sd.max_irq_off_us,
+                  (unsigned long)storage.submitted, (unsigned long)storage.completed_ok,
+                  (unsigned long)storage.completed_fail, (unsigned long)storage.queue_full,
+                  (unsigned long)storage.lock_timeouts, (unsigned long)s_storage_callback_failures,
+                  (unsigned long)s_sse_delivered, (unsigned long)s_sse_pool_exhausted,
+                  (unsigned long)s_sse_post_failed,
+                  (unsigned long)diag.uptime_ms, (unsigned long)diag.boot_count,
+                  (unsigned long)diag.reset_flags);
     if (n <= 0 || n >= (int)sizeof(body))
         return;
     int r = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", n, body);
     if (r > 0 && r < (int)sizeof(response))
         send_response(pcb, response);
+}
+
+/**
+ * @brief Converts a part/whole ratio to a tenths-of-percent integer.
+ */
+static uint32_t ratio_pct_x10(uint32_t part, uint32_t whole)
+{
+    if (whole == 0U)
+    {
+        return 0U;
+    }
+    uint64_t v = (uint64_t)part * 1000ULL;
+    return (uint32_t)(v / whole);
+}
+
+static void handle_get_task_health(struct tcp_pcb *pcb)
+{
+#define TASK_HEALTH_MAX_TASKS 16
+    static TaskStatus_t tasks[TASK_HEALTH_MAX_TASKS];
+    static TaskStatus_t prev[TASK_HEALTH_MAX_TASKS];
+    static UBaseType_t prev_count = 0;
+    static uint8_t prev_valid = 0;
+    static uint32_t prev_total = 0;
+    static char body[3072], response[3328];
+
+    uint32_t total_run_time = 0;
+    UBaseType_t count = uxTaskGetSystemState(tasks, TASK_HEALTH_MAX_TASKS, &total_run_time);
+    if (count == 0)
+    {
+        send_response(pcb, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    uint32_t window_delta = prev_valid ? (total_run_time - prev_total) : 0U;
+
+    uint32_t idle_runtime = 0;
+    for (UBaseType_t i = 0; i < count; i++)
+    {
+        if (strncmp(tasks[i].pcTaskName, "IDLE", 4) == 0)
+        {
+            idle_runtime = tasks[i].ulRunTimeCounter;
+            break;
+        }
+    }
+
+    uint32_t idle_x10 = ratio_pct_x10(idle_runtime, total_run_time);
+    uint32_t busy_x10 = (idle_x10 >= 1000U) ? 0U : (1000U - idle_x10);
+
+    int n = snprintf(body, sizeof(body),
+                     "{\"runtime_available\":true,\"counter_hz\":%lu,\"stack_unit_bytes\":%u,"
+                     "\"total_run_ms\":%lu,\"window_ms\":%lu,"
+                     "\"total_cpu_pct\":%lu.%01lu,\"idle_cpu_pct\":%lu.%01lu,\"tasks\":[",
+                     (unsigned long)RUNTIME_STATS_COUNTER_HZ,
+                     (unsigned int)sizeof(StackType_t),
+                     (unsigned long)(total_run_time / (RUNTIME_STATS_COUNTER_HZ / 1000U)),
+                     (unsigned long)(window_delta / (RUNTIME_STATS_COUNTER_HZ / 1000U)),
+                     (unsigned long)(busy_x10 / 10U), (unsigned long)(busy_x10 % 10U),
+                     (unsigned long)(idle_x10 / 10U), (unsigned long)(idle_x10 % 10U));
+    if (n <= 0 || n >= (int)sizeof(body))
+    {
+        return;
+    }
+
+    for (UBaseType_t i = 0; i < count && n > 0 && n < (int)sizeof(body); i++)
+    {
+        uint32_t prev_runtime = 0;
+        if (prev_valid)
+        {
+            for (UBaseType_t j = 0; j < prev_count; j++)
+            {
+                if (prev[j].xHandle == tasks[i].xHandle)
+                {
+                    prev_runtime = prev[j].ulRunTimeCounter;
+                    break;
+                }
+            }
+        }
+
+        uint32_t task_x10 = ratio_pct_x10(tasks[i].ulRunTimeCounter, total_run_time);
+        uint32_t win_x10 = prev_valid
+                               ? ratio_pct_x10(tasks[i].ulRunTimeCounter - prev_runtime, window_delta)
+                               : 0U;
+
+        n += snprintf(body + n, sizeof(body) - (size_t)n,
+                      "%s{\"name\":\"%s\",\"state\":%u,\"priority\":%lu,"
+                      "\"stack_high_water_words\":%lu,\"stack_high_water_bytes\":%lu,\"runtime\":%lu,"
+                      "\"cpu_pct\":%lu.%01lu,\"window_cpu_pct\":%lu.%01lu}",
+                      i ? "," : "", tasks[i].pcTaskName, (unsigned int)tasks[i].eCurrentState,
+                      (unsigned long)tasks[i].uxCurrentPriority,
+                      (unsigned long)tasks[i].usStackHighWaterMark,
+                      (unsigned long)(tasks[i].usStackHighWaterMark * sizeof(StackType_t)),
+                      (unsigned long)tasks[i].ulRunTimeCounter,
+                      (unsigned long)(task_x10 / 10U), (unsigned long)(task_x10 % 10U),
+                      (unsigned long)(win_x10 / 10U), (unsigned long)(win_x10 % 10U));
+    }
+
+    if (n <= 0 || n >= (int)sizeof(body) - 2)
+    {
+        return;
+    }
+    n += snprintf(body + n, sizeof(body) - (size_t)n, "]}");
+
+    memcpy(prev, tasks, sizeof(TaskStatus_t) * (size_t)count);
+    prev_count = count;
+    prev_total = total_run_time;
+    prev_valid = 1;
+
+    int r = snprintf(response, sizeof(response),
+                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", n, body);
+    if (r > 0 && r < (int)sizeof(response))
+    {
+        send_response(pcb, response);
+    }
+#undef TASK_HEALTH_MAX_TASKS
 }
 
 /**
@@ -589,6 +741,13 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
     if (client == NULL || pcb == NULL)
     {
         api_close_conn(pcb, NULL);
+        return;
+    }
+
+    if (!Security_IsReady())
+    {
+        send_response(pcb, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        api_close_conn(pcb, client);
         return;
     }
 
@@ -628,10 +787,11 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
     }
 
     char *raw_buf = s_alert_resp_buffers[buf_idx];
+    char *body_start = raw_buf + 256;
 
     if (total == 0)
     {
-        int body_len = snprintf(raw_buf + 256, 512,
+        int body_len = snprintf(body_start, 512,
                                 "{\"total\":0,\"total_goose\":0,\"total_sv\":0,\"total_mms\":0,"
                                 "\"total_critical\":0,\"total_high\":0,\"total_warning\":0,\"total_info\":0,"
                                 "\"alerts\":[],\"count\":0}");
@@ -645,7 +805,7 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
                                "Connection: close\r\n\r\n",
                                body_len);
 
-        char *full_resp = (raw_buf + 256) - hdr_len;
+        char *full_resp = body_start - hdr_len;
         memcpy(full_resp, hdr, hdr_len);
 
         client->resp_buf = full_resp;
@@ -658,7 +818,26 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         return;
     }
 
-    if (!Security_LockSD(50))
+    int body_offset = snprintf(body_start, 512,
+                               "{\"total\":%lu,\"total_goose\":%lu,\"total_sv\":%lu,\"total_mms\":%lu,"
+                               "\"total_critical\":%lu,\"total_high\":%lu,\"total_warning\":%lu,\"total_info\":%lu,"
+                               "\"alerts\":[",
+                               (unsigned long)total,
+                               (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
+                               (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info);
+    if (body_offset <= 0 || body_offset >= 512)
+    {
+        release_alert_resp_buffer(buf_idx);
+        send_response(pcb, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        api_close_conn(pcb, client);
+        return;
+    }
+
+    /* Hand the FatFs scan to the storage owner; the TCP/IP thread must not
+     * open or read files. Ownership of the response buffer moves to the
+     * request and is returned by do_storage_complete(). */
+    StorageRequest_t *req = StorageService_Acquire();
+    if (req == NULL)
     {
         release_alert_resp_buffer(buf_idx);
         const char *busy =
@@ -673,120 +852,265 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         return;
     }
 
-    FIL file;
-    memset(&file, 0, sizeof(file));
-    FRESULT res = f_open(&file, SECURITY_ALERTS_FILE, FA_READ);
-    if (res != FR_OK)
+    req->op = STORAGE_OP_ALERT_HISTORY;
+    req->offset = (uint32_t)offset;
+    req->limit = (uint32_t)limit;
+    req->out = body_start;
+    req->out_cap = ALERT_RESP_BUF_SIZE - 256U;
+    req->out_used = (uint32_t)body_offset;
+    req->ctx = client;
+    req->ctx_gen = client->gen;
+    req->buf_idx = (int16_t)buf_idx;
+
+    client->storage_req = req;
+    client->alert_buf_idx = -1;
+
+    if (!StorageService_Submit(req))
     {
-        Security_UnlockSD();
+        client->storage_req = NULL;
         release_alert_resp_buffer(buf_idx);
-        SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "Alerts file open failed (res=%d)", (int)res);
-        char body[256];
-        int body_len = snprintf(body, sizeof(body),
-                                "{\"total\":%lu,\"total_goose\":%lu,\"total_sv\":%lu,\"total_mms\":%lu,"
-                                "\"total_critical\":%lu,\"total_high\":%lu,\"total_warning\":%lu,\"total_info\":%lu,"
-                                "\"alerts\":[],\"count\":0}",
-                                (unsigned long)total,
-                                (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
-                                (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info);
-
-        char resp[512];
-        (void)snprintf(resp, sizeof(resp),
-                       "HTTP/1.1 200 OK\r\n"
-                       "Content-Type: application/json\r\n"
-                       "Access-Control-Allow-Origin: *\r\n"
-                       "Content-Length: %d\r\n"
-                       "Connection: close\r\n\r\n%s",
-                       body_len, body);
-        send_response(pcb, resp);
+        const char *busy =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 27\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"Server is busy\"}";
+        send_response(pcb, busy);
         api_close_conn(pcb, client);
-        return;
     }
-
-    char *body_start = raw_buf + 256;
-    int body_offset = snprintf(body_start, 512,
-                               "{\"total\":%lu,\"total_goose\":%lu,\"total_sv\":%lu,\"total_mms\":%lu,"
-                               "\"total_critical\":%lu,\"total_high\":%lu,\"total_warning\":%lu,\"total_info\":%lu,"
-                               "\"alerts\":[",
-                               (unsigned long)total,
-                               (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
-                               (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info);
-
-    static char temp_line[512];
-    uint32_t records_read = 0, records_seen = 0;
-    while (records_read < limit && (ALERT_RESP_BUF_SIZE - 256 - body_offset) > 520)
-    {
-        if (f_gets(temp_line, sizeof(temp_line), &file) == NULL)
-        {
-            break;
-        }
-
-        size_t slen = strlen(temp_line);
-        while (slen > 0 && (temp_line[slen - 1] == '\r' || temp_line[slen - 1] == '\n'))
-        {
-            temp_line[--slen] = '\0';
-        }
-
-        if (slen == 0)
-        {
-            continue;
-        }
-
-        if (records_seen++ < offset)
-            continue;
-        if (records_read > 0)
-        {
-            body_start[body_offset++] = ',';
-        }
-
-        memcpy(&body_start[body_offset], temp_line, slen);
-        body_offset += (int)slen;
-        records_read++;
-    }
-
-    body_offset += snprintf(&body_start[body_offset], 64,
-                            "],\"count\":%lu}", (unsigned long)records_read);
-
-    f_close(&file);
-    Security_UnlockSD();
-
-    char hdr[256];
-    int hdr_len = snprintf(hdr, sizeof(hdr),
-                           "HTTP/1.1 200 OK\r\n"
-                           "Content-Type: application/json\r\n"
-                           "Access-Control-Allow-Origin: *\r\n"
-                           "Content-Length: %d\r\n"
-                           "Connection: close\r\n\r\n",
-                           body_offset);
-
-    char *full_resp = body_start - hdr_len;
-    memcpy(full_resp, hdr, hdr_len);
-
-    client->resp_buf = full_resp;
-    client->resp_len = hdr_len + body_offset;
-    client->resp_sent = 0;
-    client->alert_buf_idx = buf_idx;
-    client->alerts_active = 1;
-
-    tcp_nagle_disable(pcb);
-    stream_alerts_response(pcb, client);
 }
 
 /**
  * @brief Handles DELETE /api/alerts and POST /api/alerts/clear requests.
+ *        The alert log is truncated by the storage owner, not the TCP/IP thread.
  */
-static void handle_clear_alerts(struct tcp_pcb *pcb)
+static void handle_clear_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
-    Security_ClearAlertsOnSD();
-    const char *resp =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Access-Control-Allow-Origin: *\r\n"
-        "Content-Length: 32\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{\"status\":\"ok\",\"cleared\":true}\r\n";
-    send_response(pcb, resp);
+    StorageRequest_t *req = StorageService_Acquire();
+    if (req == NULL)
+    {
+        const char *error =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 24\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"clear failed\"}";
+        send_response(pcb, error);
+        api_close_conn(pcb, client);
+        return;
+    }
+
+    req->op = STORAGE_OP_ALERT_CLEAR;
+    req->ctx = client;
+    req->ctx_gen = client->gen;
+    req->buf_idx = -1;
+
+    client->storage_req = req;
+
+    if (!StorageService_Submit(req))
+    {
+        client->storage_req = NULL;
+        const char *error =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 24\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"clear failed\"}";
+        send_response(pcb, error);
+        api_close_conn(pcb, client);
+    }
+}
+
+/**
+ * @brief Sends a JSON error response with a computed Content-Length.
+ */
+static void send_json_error(struct tcp_pcb *pcb, const char *status, const char *json)
+{
+    char buf[192];
+    int n = snprintf(buf, sizeof(buf),
+                     "HTTP/1.1 %s\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Access-Control-Allow-Origin: *\r\n"
+                     "Content-Length: %u\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     status, (unsigned)strlen(json), json);
+    if (n > 0 && n < (int)sizeof(buf))
+    {
+        send_response(pcb, buf);
+    }
+}
+
+/**
+ * @brief Runs on the TCP/IP thread when the storage owner finishes a request.
+ *        Validates that the client is still the one that submitted the request.
+ */
+static void do_storage_complete(void *ctx)
+{
+    StorageRequest_t *req = (StorageRequest_t *)ctx;
+    if (req == NULL)
+    {
+        return;
+    }
+
+    HTTP_API_Client_t *client = (HTTP_API_Client_t *)req->ctx;
+    int buf_idx = req->buf_idx;
+
+    if (client == NULL || !client->in_use || client->gen != req->ctx_gen || client->pcb == NULL)
+    {
+        if (buf_idx >= 0)
+        {
+            release_alert_resp_buffer(buf_idx);
+        }
+        StorageService_Release(req);
+        return;
+    }
+
+    struct tcp_pcb *pcb = client->pcb;
+    client->storage_req = NULL;
+
+    switch ((StorageOp_t)req->op)
+    {
+    case STORAGE_OP_ALERT_HISTORY:
+    {
+        if (buf_idx < 0)
+        {
+            break;
+        }
+        if (!req->ok)
+        {
+            release_alert_resp_buffer(buf_idx);
+            SysLog_Print(SYSLOG_LEVEL_WARN, "HTTP", "Alert history read failed");
+            send_json_error(pcb, "503 Service Unavailable", "{\"error\":\"history unavailable\"}");
+            api_close_conn(pcb, client);
+            break;
+        }
+
+        char *body_start = s_alert_resp_buffers[buf_idx] + 256;
+        int body_offset = (int)req->out_used;
+        int tail = snprintf(&body_start[body_offset], 64,
+                            "],\"count\":%lu}", (unsigned long)req->records_read);
+        if (tail <= 0 || tail >= 64)
+        {
+            release_alert_resp_buffer(buf_idx);
+            send_json_error(pcb, "500 Internal Server Error", "{\"error\":\"internal\"}");
+            api_close_conn(pcb, client);
+            break;
+        }
+        body_offset += tail;
+
+        char hdr[256];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+                               "HTTP/1.1 200 OK\r\n"
+                               "Content-Type: application/json\r\n"
+                               "Access-Control-Allow-Origin: *\r\n"
+                               "Content-Length: %d\r\n"
+                               "Connection: close\r\n\r\n",
+                               body_offset);
+        if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr))
+        {
+            release_alert_resp_buffer(buf_idx);
+            api_close_conn(pcb, client);
+            break;
+        }
+
+        char *full_resp = body_start - hdr_len;
+        memcpy(full_resp, hdr, hdr_len);
+
+        client->resp_buf = full_resp;
+        client->resp_len = (uint32_t)(hdr_len + body_offset);
+        client->resp_sent = 0;
+        client->alert_buf_idx = (int8_t)buf_idx;
+        client->alerts_active = 1;
+        req->buf_idx = -1; /* ownership returned to the client */
+
+        tcp_nagle_disable(pcb);
+        stream_alerts_response(pcb, client);
+        break;
+    }
+
+    case STORAGE_OP_ALERT_CLEAR:
+        if (req->ok)
+        {
+            const char *resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Content-Length: 32\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"status\":\"ok\",\"cleared\":true}\r\n";
+            send_response(pcb, resp);
+        }
+        else
+        {
+            send_json_error(pcb, "503 Service Unavailable", "{\"error\":\"clear failed\"}");
+        }
+        api_close_conn(pcb, client);
+        break;
+
+    case STORAGE_OP_CONFIG_SAVE:
+    {
+        SystemConfig_t cfg;
+        SystemConfig_Get(&cfg);
+
+        int body_len = SystemConfig_ToJson(&cfg, s_config_json_body, sizeof(s_config_json_body));
+        if (body_len < 0)
+        {
+            body_len = 0;
+        }
+
+        int resp_len = snprintf(s_config_response, sizeof(s_config_response),
+                                "HTTP/1.1 %s\r\n"
+                                "Content-Type: application/json\r\n"
+                                "Access-Control-Allow-Origin: *\r\n"
+                                "Content-Length: %d\r\n"
+                                "Connection: close\r\n"
+                                "\r\n"
+                                "%s",
+                                req->ok ? "200 OK" : "500 Internal Server Error",
+                                body_len, s_config_json_body);
+
+        if (resp_len > 0 && resp_len < (int)sizeof(s_config_response))
+        {
+            send_response(pcb, s_config_response);
+        }
+        api_close_conn(pcb, client);
+        break;
+    }
+
+    default:
+        api_close_conn(pcb, client);
+        break;
+    }
+
+    StorageService_Release(req);
+}
+
+/**
+ * @brief Storage-owner completion hook. Runs on the storage task; must not block
+ *        on filesystem or TCP/IP resources.
+ */
+static void storage_complete_hook(StorageRequest_t *req)
+{
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
+        if (tcpip_try_callback(do_storage_complete, req) == ERR_OK)
+        {
+            return;
+        }
+        osDelay(5);
+    }
+
+    s_storage_callback_failures++;
+    if (req->buf_idx >= 0)
+    {
+        release_alert_resp_buffer(req->buf_idx);
+        req->buf_idx = -1;
+    }
+    StorageService_Release(req);
 }
 
 /**
@@ -991,6 +1315,15 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
     client->last_activity = HAL_GetTick();
 
+    if (client->storage_req != NULL)
+    {
+        /* The storage owner is still serving this connection; ignore pipelined
+         * data instead of queueing a second filesystem request. */
+        tcp_recved(pcb, p->tot_len);
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
     if (!client->header_complete)
     {
         uint16_t copy_len = p->tot_len;
@@ -1038,6 +1371,15 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         {
             tcp_recved(pcb, p->tot_len);
             handle_get_accounting(pcb);
+            pbuf_free(p);
+            api_close_conn(pcb, client);
+            return ERR_OK;
+        }
+
+        if (strncmp(client->request, "GET /api/task-health", 20) == 0)
+        {
+            tcp_recved(pcb, p->tot_len);
+            handle_get_task_health(pcb);
             pbuf_free(p);
             api_close_conn(pcb, client);
             return ERR_OK;
@@ -1103,9 +1445,8 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         {
             tcp_recved(pcb, p->tot_len);
             SysLog_Print(SYSLOG_LEVEL_INFO, "SEC", "Alert history cleared via HTTP API");
-            handle_clear_alerts(pcb);
+            handle_clear_alerts(pcb, client);
             pbuf_free(p);
-            api_close_conn(pcb, client);
             return ERR_OK;
         }
 
@@ -1122,9 +1463,8 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         {
             tcp_recved(pcb, p->tot_len);
             SysLog_Print(SYSLOG_LEVEL_INFO, "CONFIG", "Configuration reset to factory defaults");
-            handle_reset_config(pcb);
+            handle_reset_config(pcb, client);
             pbuf_free(p);
-            api_close_conn(pcb, client);
             return ERR_OK;
         }
 
@@ -1145,9 +1485,8 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             {
                 tcp_recved(pcb, p->tot_len);
                 client->request[body_offset + client->content_length] = '\0';
-                handle_post_config(pcb, client->request + body_offset, (uint16_t)client->content_length);
+                handle_post_config(pcb, client->request + body_offset, (uint16_t)client->content_length, client);
                 pbuf_free(p);
-                api_close_conn(pcb, client);
                 return ERR_OK;
             }
             else
@@ -1274,10 +1613,9 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
         if (client->body_received >= client->content_length)
         {
             client->request[body_offset + client->content_length] = '\0';
-            handle_post_config(pcb, client->request + body_offset, (uint16_t)client->content_length);
+            handle_post_config(pcb, client->request + body_offset, (uint16_t)client->content_length, client);
             client->post_config_active = 0;
             pbuf_free(p);
-            api_close_conn(pcb, client);
             return ERR_OK;
         }
 
@@ -1342,6 +1680,8 @@ void HTTP_API_Init(void)
     {
         s_alert_pool_mutex = osMutexCreate(osMutex(AlertPoolMutex));
     }
+
+    StorageService_SetCompleteHook(storage_complete_hook);
 
     api_pcb = tcp_new();
     if (api_pcb == NULL)
@@ -1420,9 +1760,11 @@ static void do_broadcast_alert(void *ctx)
                 {
                     tcp_output(curr->pcb);
                     curr->last_activity = HAL_GetTick();
+                    s_sse_delivered++;
                 }
                 else if (err == ERR_MEM)
                 {
+                    s_sse_post_failed++;
                 }
                 else
                 {
@@ -1484,6 +1826,7 @@ void HTTP_API_BroadcastAlert(const char *json_line, uint16_t len)
     if (msg == NULL)
     {
         osMutexRelease(s_alert_pool_mutex);
+        s_sse_pool_exhausted++;
         return;
     }
 
@@ -1504,8 +1847,9 @@ void HTTP_API_BroadcastAlert(const char *json_line, uint16_t len)
 
     osMutexRelease(s_alert_pool_mutex);
 
-    if (tcpip_callback(do_broadcast_alert, msg) != ERR_OK)
+    if (tcpip_try_callback(do_broadcast_alert, msg) != ERR_OK)
     {
+        s_sse_post_failed++;
         if (s_alert_pool_mutex != NULL)
         {
             osMutexWait(s_alert_pool_mutex, osWaitForever);

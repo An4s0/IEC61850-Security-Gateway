@@ -218,7 +218,12 @@ void SCD_Storage_Task(void const *argument)
 
         if (chunk->type == SCD_EVENT_START)
         {
-            Security_LockSD(1000);
+            if (!Security_LockSD(1000))
+            {
+                s_upload_ok = 0;
+                SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD start SD lock timeout");
+                continue;
+            }
             if (SCD_FileOpen)
             {
                 f_close(&SCD_File);
@@ -246,7 +251,13 @@ void SCD_Storage_Task(void const *argument)
         {
             if (SCD_FileOpen && s_upload_ok)
             {
-                Security_LockSD(1000);
+                if (!Security_LockSD(1000))
+                {
+                    s_upload_ok = 0;
+                    SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD write SD lock timeout");
+                    SCD_Storage_Free(chunk);
+                    continue;
+                }
                 UINT bytesWritten = 0;
                 FRESULT r = f_write(&SCD_File, chunk->data, chunk->length, &bytesWritten);
                 if (r != FR_OK || bytesWritten != chunk->length)
@@ -262,14 +273,22 @@ void SCD_Storage_Task(void const *argument)
             bool ok = false;
             if (SCD_FileOpen)
             {
-                Security_LockSD(1000);
+                if (!Security_LockSD(1000))
+                {
+                    s_upload_ok = 0;
+                    s_storage_result_ok = false;
+                    SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD end SD lock timeout");
+                    if (SCDEndDoneSemHandle != NULL)
+                        osSemaphoreRelease(SCDEndDoneSemHandle);
+                    continue;
+                }
                 if (s_upload_ok)
                 {
-                    f_sync(&SCD_File);
+                    FRESULT sync_res = f_sync(&SCD_File);
                     FRESULT res = f_close(&SCD_File);
                     SCD_FileOpen = 0;
 
-                    if (res == FR_OK)
+                    if (sync_res == FR_OK && res == FR_OK)
                     {
                         SysLog_Print(SYSLOG_LEVEL_INFO, "STORAGE", "SCD upload file saved, requesting reload");
                         SCD_Config_RequestReload();
@@ -277,7 +296,7 @@ void SCD_Storage_Task(void const *argument)
                     }
                     else
                     {
-                        SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD file close failed (FRESULT %d)", res);
+                        SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD sync/close failed (%d/%d)", sync_res, res);
                     }
                 }
                 else
@@ -300,7 +319,13 @@ void SCD_Storage_Task(void const *argument)
         {
             if (SCD_FileOpen)
             {
-                Security_LockSD(1000);
+                if (!Security_LockSD(1000))
+                {
+                    s_upload_ok = 0;
+                    s_storage_result_ok = false;
+                    SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD abort SD lock timeout");
+                    continue;
+                }
                 f_close(&SCD_File);
                 SCD_FileOpen = 0;
                 f_unlink(SCD_CONFIG_FILE_PATH);
