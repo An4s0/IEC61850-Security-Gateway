@@ -1,9 +1,45 @@
 #include "sdmmc.h"
+#include "runtime_stats.h"
 #include "cmsis_os.h"
 #include <string.h>
 
 static volatile uint32_t s_last_sta = 0;
 volatile uint32_t g_last_read_count = 0;
+static SDMMC_Diagnostics_t s_diagnostics;
+
+static void sdmmc_increment(uint32_t *value)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (*value != UINT32_MAX)
+        (*value)++;
+    __set_PRIMASK(primask);
+}
+
+void SDMMC_GetDiagnostics(SDMMC_Diagnostics_t *out)
+{
+    if (out == NULL)
+        return;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *out = s_diagnostics;
+    __set_PRIMASK(primask);
+}
+
+/**
+ * @brief Records the longest observed interrupt-disabled FIFO burst, in microseconds.
+ */
+static void sdmmc_record_irq_off(uint32_t start, uint32_t end)
+{
+    uint32_t elapsed = end - start;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (elapsed > s_diagnostics.max_irq_off_us)
+    {
+        s_diagnostics.max_irq_off_us = elapsed;
+    }
+    __set_PRIMASK(primask);
+}
 
 /**
  * @brief Delays execution using the RTOS scheduler or a busy-wait loop.
@@ -544,7 +580,10 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
 
     ret = sdmmc_wait_card_ready(info, 1000);
     if (ret != SDMMC_OK)
+    {
+        sdmmc_increment(&s_diagnostics.card_ready_timeouts);
         return ret;
+    }
 
     sdmmc_clear_flags();
 
@@ -558,6 +597,7 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
 
     uint32_t count = 0;
     uint32_t *buf32 = (uint32_t *)buf;
+    uint32_t start_tick = HAL_GetTick();
 
     while (count < 128)
     {
@@ -571,7 +611,7 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
             }
         }
 
-        if (sta & (SDMMC_STA_DTIMEOUT | SDMMC_STA_RXOVERR))
+        if (sta & (SDMMC_STA_DTIMEOUT | SDMMC_STA_RXOVERR | SDMMC_STA_DCRCFAIL))
         {
             s_last_sta = sta;
             sdmmc_clear_flags();
@@ -581,10 +621,19 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
                 return SDMMC_ERR_DATA_TIMEOUT;
             if (sta & SDMMC_STA_RXOVERR)
                 return SDMMC_ERR_RX_OVERRUN;
+            return SDMMC_ERR_DATA_CRC;
         }
 
         if (sta & SDMMC_STA_DATAEND)
             break;
+
+        if ((HAL_GetTick() - start_tick) > 4000U)
+        {
+            s_last_sta = sta;
+            sdmmc_clear_flags();
+            SDMMC1->DCTRL = 0;
+            return SDMMC_ERR_TIMEOUT;
+        }
     }
 
     while ((SDMMC1->STA & SDMMC_STA_RXDAVL) && count < 128)
@@ -593,34 +642,39 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
     }
     g_last_read_count = count;
 
-    uint32_t timeout = 0x01000000U;
-    while (timeout--)
+    while (1)
     {
         sta = SDMMC1->STA;
         if (sta & (SDMMC_STA_DATAEND | SDMMC_STA_DCRCFAIL | SDMMC_STA_DTIMEOUT | SDMMC_STA_RXOVERR))
         {
             s_last_sta = sta;
             if (sta & SDMMC_STA_DTIMEOUT)
-                return SDMMC_ERR_DATA_TIMEOUT;
+                break;
             if (sta & SDMMC_STA_DCRCFAIL)
-                return SDMMC_ERR_DATA_CRC;
+                break;
             if (sta & SDMMC_STA_RXOVERR)
-                return SDMMC_ERR_RX_OVERRUN;
+                break;
             break;
         }
-    }
-
-    if (timeout == 0)
-    {
-        s_last_sta = SDMMC1->STA;
-        sdmmc_clear_flags();
-        SDMMC1->DCTRL = 0;
-        return SDMMC_ERR_TIMEOUT;
+        if ((HAL_GetTick() - start_tick) > 4000U)
+        {
+            s_last_sta = sta;
+            sdmmc_clear_flags();
+            SDMMC1->DCTRL = 0;
+            return SDMMC_ERR_TIMEOUT;
+        }
     }
 
     s_last_sta = SDMMC1->STA;
     sdmmc_clear_flags();
     SDMMC1->DCTRL = 0;
+
+    if (sta & SDMMC_STA_DTIMEOUT)
+        return SDMMC_ERR_DATA_TIMEOUT;
+    if (sta & SDMMC_STA_DCRCFAIL)
+        return SDMMC_ERR_DATA_CRC;
+    if (sta & SDMMC_STA_RXOVERR)
+        return SDMMC_ERR_RX_OVERRUN;
 
     if (count < 128)
         return SDMMC_ERR_GENERAL;
@@ -641,11 +695,15 @@ int SDMMC_ReadBlock(SD_CardInfo_t *info, uint32_t block, uint8_t *buf)
         if (ret == SDMMC_OK)
             return SDMMC_OK;
 
+        if (ret == SDMMC_ERR_TIMEOUT || ret == SDMMC_ERR_CMD_TIMEOUT || ret == SDMMC_ERR_DATA_TIMEOUT)
+            sdmmc_increment(&s_diagnostics.timeouts);
+
         SDMMC1->DCTRL = 0;
         sdmmc_clear_flags();
         sdmmc_delay_ms(5);
         sdmmc_wait_card_ready(info, 500);
     }
+    sdmmc_increment(&s_diagnostics.read_failures);
     return ret;
 }
 
@@ -680,7 +738,10 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
 
     ret = sdmmc_wait_card_ready(info, 1000);
     if (ret != SDMMC_OK)
+    {
+        sdmmc_increment(&s_diagnostics.card_ready_timeouts);
         return ret;
+    }
 
     sdmmc_clear_flags();
 
@@ -707,25 +768,28 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
     uint32_t count = 0;
     uint32_t start_tick = HAL_GetTick();
 
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-
     while (count < 128)
     {
         sta = SDMMC1->STA;
         if (sta & (SDMMC_STA_TXUNDERR | SDMMC_STA_DCRCFAIL | SDMMC_STA_DTIMEOUT))
             break;
 
+        if ((HAL_GetTick() - start_tick) > 4000U)
+            break;
+
         if (sta & (SDMMC_STA_TXFIFOHE | SDMMC_STA_TXFIFOE))
         {
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
+            uint32_t burst_start = RunTimeStats_GetCount();
             for (int i = 0; i < 8 && count < 128; i++)
             {
                 SDMMC1->FIFO = buf32[count++];
             }
+            sdmmc_record_irq_off(burst_start, RunTimeStats_GetCount());
+            __set_PRIMASK(primask);
         }
     }
-
-    __set_PRIMASK(primask);
 
     while (!(SDMMC1->STA & (SDMMC_STA_DATAEND | SDMMC_STA_DBCKEND | SDMMC_STA_DCRCFAIL | SDMMC_STA_DTIMEOUT | SDMMC_STA_TXUNDERR)))
     {
@@ -744,12 +808,17 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
         return SDMMC_ERR_DATA_CRC;
     if (sta & SDMMC_STA_TXUNDERR)
         return SDMMC_ERR_TX_UNDERRUN;
+    if (count != 128)
+        return SDMMC_ERR_TIMEOUT;
     if (!(sta & (SDMMC_STA_DBCKEND | SDMMC_STA_DATAEND)))
         return SDMMC_ERR_TIMEOUT;
 
     ret = sdmmc_wait_card_ready(info, 5000);
     if (ret != SDMMC_OK)
+    {
+        sdmmc_increment(&s_diagnostics.card_ready_timeouts);
         return SDMMC_ERR_WRITE_FAIL;
+    }
 
     sdmmc_delay_ms(1);
     return SDMMC_OK;
@@ -761,17 +830,35 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
 int SDMMC_WriteBlock(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf)
 {
     int ret = SDMMC_OK;
+    uint32_t start = HAL_GetTick();
     for (int retry = 0; retry < 3; retry++)
     {
+        if (retry != 0)
+            sdmmc_increment(&s_diagnostics.write_retries);
         ret = sdmmc_write_block_single(info, block, buf);
         if (ret == SDMMC_OK)
-            return SDMMC_OK;
+        {
+            if (retry != 0)
+                sdmmc_increment(&s_diagnostics.write_recovered);
+            break;
+        }
+
+        if (ret == SDMMC_ERR_TIMEOUT || ret == SDMMC_ERR_CMD_TIMEOUT || ret == SDMMC_ERR_DATA_TIMEOUT)
+            sdmmc_increment(&s_diagnostics.timeouts);
 
         SDMMC1->DCTRL = 0;
         sdmmc_clear_flags();
         sdmmc_delay_ms(5);
         sdmmc_wait_card_ready(info, 500);
     }
+    if (ret != SDMMC_OK)
+        sdmmc_increment(&s_diagnostics.write_failures);
+    uint32_t elapsed = HAL_GetTick() - start;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (elapsed > s_diagnostics.max_write_ms)
+        s_diagnostics.max_write_ms = elapsed;
+    __set_PRIMASK(primask);
     return ret;
 }
 

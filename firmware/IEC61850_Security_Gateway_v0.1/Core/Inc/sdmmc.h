@@ -29,6 +29,18 @@
 #define SDMMC_ERR_GENERAL 10
 #define SDMMC_ERR_WRITE_FAIL 11
 
+typedef struct
+{
+    uint32_t read_failures;
+    uint32_t write_failures;
+    uint32_t write_retries;
+    uint32_t write_recovered;
+    uint32_t timeouts;
+    uint32_t max_write_ms;
+    uint32_t card_ready_timeouts;
+    uint32_t max_irq_off_us;
+} SDMMC_Diagnostics_t;
+
 #define SD_CMD0_GO_IDLE_STATE 0
 #define SD_CMD2_ALL_SEND_CID 2
 #define SD_CMD3_SEND_RELATIVE_ADDR 3
@@ -98,5 +110,6 @@ int SDMMC_WriteBlock(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf);
 int SDMMC_WriteBlocks(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf, uint32_t count);
 const char *SDMMC_ErrorString(int err);
 uint32_t SDMMC_GetLastStatus(void);
+void SDMMC_GetDiagnostics(SDMMC_Diagnostics_t *out);
 
 #endif /* __SDMMC_H */
