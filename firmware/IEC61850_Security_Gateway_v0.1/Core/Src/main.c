@@ -416,7 +416,6 @@ void StartDefaultTask(void const *argument)
 
   for (;;)
   {
-    osDelay(100);
     StorageService_Run();
   }
   /* USER CODE END 5 */

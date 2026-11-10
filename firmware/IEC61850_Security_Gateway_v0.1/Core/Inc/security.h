@@ -67,6 +67,7 @@ void Security_PeriodicFlush(void);
 bool Security_ClearAlertsOnSD(void);
 bool Security_HasPendingAlert(void);
 uint32_t Security_PurgePendingAlerts(void);
+uint32_t Security_GetPipelineCapacity(void);
 uint32_t Security_GetAlertCount(void);
 bool Security_IsReady(void);
 void Security_GetStats(Security_Stats_t *stats);

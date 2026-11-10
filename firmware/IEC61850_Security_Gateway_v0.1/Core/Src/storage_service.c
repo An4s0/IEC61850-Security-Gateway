@@ -9,6 +9,9 @@
 #include <string.h>
 
 #define STORAGE_HISTORY_LINE_MAX 512
+#define STORAGE_PAGE_BLOCK 2048
+#define STORAGE_PAGE_MAX_RECORDS 40
+#define STORAGE_FILTER_PREFIX 224
 #define STORAGE_LOCK_TIMEOUT_MS 1000
 #define STORAGE_CLEAR_DRAIN_MS 2000
 
@@ -20,6 +23,82 @@ static StorageCompleteHook_t s_complete_hook = NULL;
 static StorageService_Stats_t s_stats;
 
 static char s_history_line[STORAGE_HISTORY_LINE_MAX];
+static char s_filter_prefix[STORAGE_FILTER_PREFIX];
+
+/*
+ * Filter patterns are matched against the fixed prefix of a stored record
+ * ("proto" and "sev" are emitted before any free-text field), so a filtered
+ * scan only needs the first STORAGE_FILTER_PREFIX bytes of each line.
+ */
+static const char *const s_proto_patterns[] = {
+    NULL, "\"proto\":\"GOOSE\"", "\"proto\":\"SV\"", "\"proto\":\"MMS\""};
+static const char *const s_sev_patterns[] = {
+    NULL, "\"sev\":\"INFO\"", "\"sev\":\"WARNING\"", "\"sev\":\"HIGH\"",
+    "\"sev\":\"CRITICAL\""};
+
+/**
+ * @brief Tests one NUL-terminated record prefix against the request filters.
+ */
+static bool alert_prefix_matches(const char *text, const StorageRequest_t *req)
+{
+    if (req->proto_filter != STORAGE_ALERT_PROTO_ANY)
+    {
+        if (req->proto_filter > STORAGE_ALERT_PROTO_MMS ||
+            s_proto_patterns[req->proto_filter] == NULL ||
+            strstr(text, s_proto_patterns[req->proto_filter]) == NULL)
+        {
+            return false;
+        }
+    }
+    if (req->sev_filter != STORAGE_ALERT_SEV_ANY)
+    {
+        if (req->sev_filter > STORAGE_ALERT_SEV_CRITICAL ||
+            s_sev_patterns[req->sev_filter] == NULL ||
+            strstr(text, s_sev_patterns[req->sev_filter]) == NULL)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Tests one stored record against the request filters, reading only the
+ *        fixed prefix that carries the "proto" and "sev" fields.
+ *        Executes in the storage-owner task with the log file already open.
+ */
+static bool alert_record_matches(FIL *file, const char *blk, uint32_t blk_start,
+                                 UINT blk_len, uint32_t start, uint32_t len,
+                                 const StorageRequest_t *req)
+{
+    uint32_t take = (len < (uint32_t)STORAGE_FILTER_PREFIX - 1U)
+                        ? len
+                        : (uint32_t)STORAGE_FILTER_PREFIX - 1U;
+
+    if (take == 0U)
+    {
+        return true;
+    }
+
+    if (start >= blk_start && (start - blk_start) + take <= blk_len)
+    {
+        memcpy(s_filter_prefix, &blk[start - blk_start], take);
+        s_filter_prefix[take] = '\0';
+        return alert_prefix_matches(s_filter_prefix, req);
+    }
+
+    UINT got = 0;
+    if (f_lseek(file, start) != FR_OK)
+    {
+        return false;
+    }
+    if (f_read(file, s_filter_prefix, take, &got) != FR_OK || got != take)
+    {
+        return false;
+    }
+    s_filter_prefix[take] = '\0';
+    return alert_prefix_matches(s_filter_prefix, req);
+}
 
 static void storage_stat_inc(uint32_t *field)
 {
@@ -174,6 +253,11 @@ static bool storage_do_alert_history(StorageRequest_t *req)
             continue;
         }
 
+        if (!alert_prefix_matches(s_history_line, req))
+        {
+            continue;
+        }
+
         if (seen++ < req->offset)
         {
             continue;
@@ -207,6 +291,189 @@ static bool storage_do_alert_history(StorageRequest_t *req)
     Security_UnlockSD();
     req->out_used = off;
     req->records_read = read;
+    return true;
+}
+
+/**
+ * @brief Emits one page of alerts in newest-first order.
+ *
+ * The alert log is append-only NDJSON, so the newest record is at the end of the
+ * file. Scanning backwards from the requested cursor keeps each page at O(page)
+ * work and never loads the whole history. The cursor returned to the client is
+ * the byte offset of the oldest record in the page, which stays valid while new
+ * records are appended at the end.
+ */
+static bool storage_do_alert_page(StorageRequest_t *req)
+{
+    static char block[STORAGE_PAGE_BLOCK];
+    uint32_t starts[STORAGE_PAGE_MAX_RECORDS];
+    uint32_t lengths[STORAGE_PAGE_MAX_RECORDS];
+    uint16_t found = 0;
+
+    uint32_t limit = req->limit;
+    if (limit == 0U || limit > STORAGE_PAGE_MAX_RECORDS)
+    {
+        limit = STORAGE_PAGE_MAX_RECORDS;
+    }
+
+    if (!Security_LockSD(STORAGE_LOCK_TIMEOUT_MS))
+    {
+        storage_stat_inc(&s_stats.lock_timeouts);
+        return false;
+    }
+
+    FIL file;
+    memset(&file, 0, sizeof(file));
+    FRESULT res = f_open(&file, SECURITY_ALERTS_FILE, FA_READ);
+    if (res != FR_OK)
+    {
+        Security_UnlockSD();
+        req->records_read = 0;
+        req->cursor_out = 0;
+        req->has_more = 0;
+        /* Leave out_used untouched so the caller still emits a valid empty page. */
+        return (res == FR_NO_FILE || res == FR_NO_PATH);
+    }
+
+    FSIZE_t size = f_size(&file);
+    uint32_t scan = (req->cursor_in == UINT32_MAX || req->cursor_in > (uint32_t)size)
+                        ? (uint32_t)size
+                        : req->cursor_in;
+
+    uint32_t block_start = 0;
+    UINT block_len = 0;
+    uint32_t line_len = 0;
+
+    while (scan > 0U && found < limit)
+    {
+        scan--;
+
+        if (scan < block_start || scan >= block_start + block_len)
+        {
+            uint32_t upper = scan + 1U;
+            block_start = (upper > STORAGE_PAGE_BLOCK) ? (upper - STORAGE_PAGE_BLOCK) : 0U;
+            UINT got = 0;
+            res = f_lseek(&file, block_start);
+            if (res == FR_OK)
+            {
+                res = f_read(&file, block, (UINT)(upper - block_start), &got);
+            }
+            if (res != FR_OK)
+            {
+                break;
+            }
+            block_len = got;
+        }
+
+        char c = block[scan - block_start];
+        if (c == '\n')
+        {
+            if (line_len > 0U)
+            {
+                uint32_t rec_start = scan + 1U;
+                bool accept = true;
+
+                if (req->proto_filter != STORAGE_ALERT_PROTO_ANY ||
+                    req->sev_filter != STORAGE_ALERT_SEV_ANY)
+                {
+                    accept = alert_record_matches(&file, block, block_start, block_len,
+                                                  rec_start, line_len, req);
+                }
+
+                if (accept)
+                {
+                    starts[found] = rec_start;
+                    lengths[found] = line_len;
+                    found++;
+                }
+                line_len = 0;
+            }
+        }
+        else if (c != '\r')
+        {
+            line_len++;
+        }
+    }
+
+    if (found < limit && line_len > 0U && scan == 0U)
+    {
+        bool accept = true;
+        if (req->proto_filter != STORAGE_ALERT_PROTO_ANY ||
+            req->sev_filter != STORAGE_ALERT_SEV_ANY)
+        {
+            accept = alert_record_matches(&file, block, block_start, block_len, 0U,
+                                          line_len, req);
+        }
+        if (accept)
+        {
+            starts[found] = 0U;
+            lengths[found] = line_len;
+            found++;
+        }
+    }
+
+    if (res != FR_OK)
+    {
+        (void)f_close(&file);
+        Security_UnlockSD();
+        return false;
+    }
+
+    uint32_t off = req->out_used;
+    uint32_t emitted = 0;
+
+    for (uint16_t i = 0; i < found; i++)
+    {
+        uint32_t len = lengths[i];
+        uint32_t room = req->out_cap - off;
+        uint32_t needed = len + 80U; /* leave room for the JSON suffix */
+
+        if (len == 0U || room <= needed)
+        {
+            break;
+        }
+        if (emitted > 0U)
+        {
+            req->out[off++] = ',';
+        }
+
+        res = f_lseek(&file, starts[i]);
+        if (res != FR_OK)
+        {
+            break;
+        }
+        UINT got = 0;
+        res = f_read(&file, &req->out[off], len, &got);
+        if (res != FR_OK || got != len)
+        {
+            break;
+        }
+
+        off += len;
+        if (off > 0U && req->out[off - 1U] == '\r')
+        {
+            off--;
+        }
+        emitted++;
+    }
+
+    (void)f_close(&file);
+    Security_UnlockSD();
+
+    req->out_used = off;
+    req->records_read = emitted;
+
+    if (emitted > 0U)
+    {
+        req->cursor_out = starts[emitted - 1U];
+        req->has_more = (starts[emitted - 1U] > 0U) ? 1U : 0U;
+    }
+    else
+    {
+        req->cursor_out = 0U;
+        req->has_more = 0U;
+    }
+
     return true;
 }
 
@@ -260,6 +527,8 @@ static bool storage_dispatch(StorageRequest_t *req)
     {
     case STORAGE_OP_ALERT_HISTORY:
         return storage_do_alert_history(req);
+    case STORAGE_OP_ALERT_PAGE:
+        return storage_do_alert_page(req);
     case STORAGE_OP_ALERT_CLEAR:
         return storage_do_alert_clear(req);
     case STORAGE_OP_CONFIG_SAVE:
@@ -311,4 +580,8 @@ void StorageService_Run(void)
     }
 
     SysLog_PeriodicFlush();
+
+    /* Wake quickly while alerts are waiting so a burst is drained before the
+     * ring fills; otherwise keep the low-rate background cadence. */
+    osDelay(Security_HasPendingAlert() ? 1 : 100);
 }

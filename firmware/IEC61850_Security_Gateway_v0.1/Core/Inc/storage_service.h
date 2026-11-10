@@ -24,6 +24,7 @@ typedef enum
 {
     STORAGE_OP_NONE = 0,
     STORAGE_OP_ALERT_HISTORY,
+    STORAGE_OP_ALERT_PAGE,
     STORAGE_OP_ALERT_CLEAR,
     STORAGE_OP_CONFIG_SAVE
 } StorageOp_t;
@@ -35,6 +36,25 @@ typedef enum
     STORAGE_REQ_RUNNING,
     STORAGE_REQ_DONE
 } StorageReqState_t;
+
+/* Alert record filters applied while scanning the log, before a page is
+ * selected. STORAGE_ALERT_PROTO_ANY / STORAGE_ALERT_SEV_ANY mean "no filter". */
+typedef enum
+{
+    STORAGE_ALERT_PROTO_ANY = 0,
+    STORAGE_ALERT_PROTO_GOOSE,
+    STORAGE_ALERT_PROTO_SV,
+    STORAGE_ALERT_PROTO_MMS
+} StorageAlertProto_t;
+
+typedef enum
+{
+    STORAGE_ALERT_SEV_ANY = 0,
+    STORAGE_ALERT_SEV_INFO,
+    STORAGE_ALERT_SEV_WARNING,
+    STORAGE_ALERT_SEV_HIGH,
+    STORAGE_ALERT_SEV_CRITICAL
+} StorageAlertSev_t;
 
 typedef struct StorageRequest_s
 {
@@ -50,6 +70,13 @@ typedef struct StorageRequest_s
     uint32_t out_cap;
     uint32_t out_used;  /* offset of the first free byte when submitted */
     uint32_t records_read;
+
+    /* Newest-first page parameters and result. */
+    uint32_t cursor_in; /* byte offset to scan before; UINT32_MAX means end of file */
+    uint32_t cursor_out;/* byte offset of the oldest record returned */
+    uint8_t has_more;
+    uint8_t proto_filter; /* StorageAlertProto_t */
+    uint8_t sev_filter;   /* StorageAlertSev_t */
 
     /* Opaque completion routing owned by the HTTP layer. */
     void *ctx;

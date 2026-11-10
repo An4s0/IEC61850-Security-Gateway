@@ -221,6 +221,13 @@ static err_t api_poll(void *arg, struct tcp_pcb *pcb)
             api_close_conn(pcb, client);
             return ERR_OK;
         }
+        else if (now - client->last_activity >= 15000U)
+        {
+            /* A stalled stream must not pin the shared response buffer. */
+            SysLog_Print(SYSLOG_LEVEL_DEBUG, "HTTP", "Alert stream stalled, aborting");
+            api_abort_conn(pcb, client);
+            return ERR_ABRT;
+        }
         else
         {
             stream_alerts_response(pcb, client);
@@ -589,10 +596,11 @@ static void handle_get_accounting(struct tcp_pcb *pcb)
     if (n <= 0 || n >= (int)sizeof(body))
         return;
     n += snprintf(body + n, sizeof(body) - (size_t)n,
-                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":32,\"alerts_attempted\":%lu,\"persistence_retries\":%lu,\"alerts_dropped_buffer_full\":%lu,\"alerts_dropped_mutex_busy\":%lu,\"alerts_purged\":%lu,\"driver_delivered\":%lu,\"rx_alloc_failures\":%lu,\"dma_error_callbacks\":%lu,\"rx_buffer_unavailable_events\":%lu,\"lwip_input_failures\":%lu,\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,\"task_count\":%lu,\"sd_read_failures\":%lu,\"sd_write_failures\":%lu,\"sd_write_retries\":%lu,\"sd_write_recovered\":%lu,\"sd_timeouts\":%lu,\"sd_max_write_ms\":%lu,\"sd_card_ready_timeouts\":%lu,\"sd_max_irq_off_us\":%lu,\"storage_submitted\":%lu,\"storage_ok\":%lu,\"storage_fail\":%lu,\"storage_queue_full\":%lu,\"storage_lock_timeouts\":%lu,\"storage_cb_failures\":%lu,\"sse_delivered\":%lu,\"sse_pool_exhausted\":%lu,\"sse_post_failed\":%lu,\"uptime_ms\":%lu,\"boot_count\":%lu,\"reset_flags\":%lu}",
+                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":%lu,\"alerts_attempted\":%lu,\"persistence_retries\":%lu,\"alerts_dropped_buffer_full\":%lu,\"alerts_dropped_mutex_busy\":%lu,\"alerts_purged\":%lu,\"driver_delivered\":%lu,\"rx_alloc_failures\":%lu,\"dma_error_callbacks\":%lu,\"rx_buffer_unavailable_events\":%lu,\"lwip_input_failures\":%lu,\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,\"task_count\":%lu,\"sd_read_failures\":%lu,\"sd_write_failures\":%lu,\"sd_write_retries\":%lu,\"sd_write_recovered\":%lu,\"sd_timeouts\":%lu,\"sd_max_write_ms\":%lu,\"sd_card_ready_timeouts\":%lu,\"sd_max_irq_off_us\":%lu,\"storage_submitted\":%lu,\"storage_ok\":%lu,\"storage_fail\":%lu,\"storage_queue_full\":%lu,\"storage_lock_timeouts\":%lu,\"storage_cb_failures\":%lu,\"sse_delivered\":%lu,\"sse_pool_exhausted\":%lu,\"sse_post_failed\":%lu,\"uptime_ms\":%lu,\"boot_count\":%lu,\"reset_flags\":%lu}",
                   (unsigned long)a.saturated, (unsigned long)a.last_parsed_ms, (unsigned long)health.alerts_generated,
                   (unsigned long)health.alerts_written, (unsigned long)health.alerts_dropped, (unsigned long)health.storage_errors,
                   (unsigned long)health.slots_in_use, (unsigned long)health.slots_high_water,
+                  (unsigned long)Security_GetPipelineCapacity(),
                   (unsigned long)health.alerts_attempted, (unsigned long)health.persistence_retries,
                   (unsigned long)health.alerts_dropped_buffer_full, (unsigned long)health.alerts_dropped_mutex_busy,
                   (unsigned long)health.alerts_purged,
@@ -734,7 +742,36 @@ static void handle_get_task_health(struct tcp_pcb *pcb)
 }
 
 /**
+ * @brief Case-insensitive comparison of a query parameter value against a
+ *        keyword. The value ends at '&', ' ', '\r' or end of string.
+ */
+static bool query_value_equals(const char *value, const char *keyword)
+{
+    size_t i = 0;
+
+    while (keyword[i] != '\0')
+    {
+        char c = value[i];
+        if (c >= 'a' && c <= 'z')
+        {
+            c = (char)(c - 'a' + 'A');
+        }
+        if (c != keyword[i])
+        {
+            return false;
+        }
+        i++;
+    }
+    return (value[i] == '\0' || value[i] == '&' || value[i] == ' ' || value[i] == '\r');
+}
+
+/**
  * @brief Handles GET /api/alerts and /api/alerts/history requests.
+ *
+ * Supports newest-first cursor pagination with optional protocol and severity
+ * filtering. Filters are applied by the storage owner while it scans the log,
+ * so a page always contains up to `limit` matching records and never requires
+ * the whole history to be transferred.
  */
 static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -752,18 +789,79 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
     }
 
     unsigned long offset = 0, limit = 40;
+    unsigned long cursor = 0;
+    bool legacy_order = false;
+    bool cursor_given = false;
+    uint8_t proto_filter = (uint8_t)STORAGE_ALERT_PROTO_ANY;
+    uint8_t sev_filter = (uint8_t)STORAGE_ALERT_SEV_ANY;
+    bool bad_filter = false;
     const char *query = strchr(client->request, '?');
     if (query != NULL)
     {
         const char *v = strstr(query, "offset=");
         if (v != NULL)
+        {
             (void)sscanf(v + 7, "%lu", &offset);
+            legacy_order = true;
+        }
+        v = strstr(query, "cursor=");
+        if (v != NULL)
+        {
+            (void)sscanf(v + 7, "%lu", &cursor);
+            cursor_given = true;
+        }
         v = strstr(query, "limit=");
         if (v != NULL)
             (void)sscanf(v + 6, "%lu", &limit);
+
+        v = strstr(query, "protocol=");
+        if (v != NULL)
+        {
+            const char *val = v + 9;
+            if (query_value_equals(val, "GOOSE"))
+                proto_filter = (uint8_t)STORAGE_ALERT_PROTO_GOOSE;
+            else if (query_value_equals(val, "SV"))
+                proto_filter = (uint8_t)STORAGE_ALERT_PROTO_SV;
+            else if (query_value_equals(val, "MMS"))
+                proto_filter = (uint8_t)STORAGE_ALERT_PROTO_MMS;
+            else if (!query_value_equals(val, "ALL"))
+                bad_filter = true;
+        }
+
+        v = strstr(query, "severity=");
+        if (v != NULL)
+        {
+            const char *val = v + 9;
+            if (query_value_equals(val, "CRITICAL"))
+                sev_filter = (uint8_t)STORAGE_ALERT_SEV_CRITICAL;
+            else if (query_value_equals(val, "HIGH"))
+                sev_filter = (uint8_t)STORAGE_ALERT_SEV_HIGH;
+            else if (query_value_equals(val, "WARNING"))
+                sev_filter = (uint8_t)STORAGE_ALERT_SEV_WARNING;
+            else if (query_value_equals(val, "INFO"))
+                sev_filter = (uint8_t)STORAGE_ALERT_SEV_INFO;
+            else if (!query_value_equals(val, "ALL"))
+                bad_filter = true;
+        }
     }
     if (limit == 0 || limit > 40)
         limit = 40;
+
+    if (bad_filter)
+    {
+        /* Prebuilt so the response never depends on a stack snprintf buffer. */
+        static const char bad_filter_resp[] =
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Content-Length: 138\r\n"
+            "Connection: close\r\n\r\n"
+            "{\"error\":\"unsupported filter\",\"allowed_protocol\":[\"GOOSE\",\"SV\",\"MMS\",\"ALL\"],"
+            "\"allowed_severity\":[\"CRITICAL\",\"HIGH\",\"WARNING\",\"INFO\",\"ALL\"]}";
+        send_response(pcb, bad_filter_resp);
+        api_close_conn(pcb, client);
+        return;
+    }
 
     uint32_t total = Security_GetAlertCount();
     uint32_t tot = 0, goose = 0, sv = 0, mms = 0;
@@ -794,7 +892,7 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         int body_len = snprintf(body_start, 512,
                                 "{\"total\":0,\"total_goose\":0,\"total_sv\":0,\"total_mms\":0,"
                                 "\"total_critical\":0,\"total_high\":0,\"total_warning\":0,\"total_info\":0,"
-                                "\"alerts\":[],\"count\":0}");
+                                "\"alerts\":[],\"count\":0,\"has_more\":false,\"next_cursor\":null}");
 
         char hdr[256];
         int hdr_len = snprintf(hdr, sizeof(hdr),
@@ -852,9 +950,12 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         return;
     }
 
-    req->op = STORAGE_OP_ALERT_HISTORY;
+    req->op = (legacy_order && !cursor_given) ? STORAGE_OP_ALERT_HISTORY : STORAGE_OP_ALERT_PAGE;
     req->offset = (uint32_t)offset;
     req->limit = (uint32_t)limit;
+    req->cursor_in = cursor_given ? (uint32_t)cursor : UINT32_MAX;
+    req->proto_filter = proto_filter;
+    req->sev_filter = sev_filter;
     req->out = body_start;
     req->out_cap = ALERT_RESP_BUF_SIZE - 256U;
     req->out_used = (uint32_t)body_offset;
@@ -878,6 +979,49 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
             "{\"error\":\"Server is busy\"}";
         send_response(pcb, busy);
         api_close_conn(pcb, client);
+    }
+}
+
+/**
+ * @brief Handles GET /api/alerts/summary.
+ *
+ * Returns the alert totals maintained in RAM. No file is opened and no record
+ * is transferred, so a dashboard can display the count cheaply.
+ */
+static void handle_get_alerts_summary(struct tcp_pcb *pcb)
+{
+    static char body[384], response[640];
+
+    uint32_t total = Security_GetAlertCount();
+    uint32_t tot = 0, goose = 0, sv = 0, mms = 0;
+    uint32_t crit = 0, high = 0, warn = 0, info = 0;
+    Security_GetGlobalStats(&tot, &goose, &sv, &mms);
+    Security_GetGlobalSevStats(&crit, &high, &warn, &info);
+
+    Security_Stats_t health;
+    Security_GetStats(&health);
+
+    int n = snprintf(body, sizeof(body),
+                     "{\"total\":%lu,\"total_goose\":%lu,\"total_sv\":%lu,\"total_mms\":%lu,"
+                     "\"total_critical\":%lu,\"total_high\":%lu,\"total_warning\":%lu,\"total_info\":%lu,"
+                     "\"pending\":%lu,\"ready\":%s}",
+                     (unsigned long)total,
+                     (unsigned long)goose, (unsigned long)sv, (unsigned long)mms,
+                     (unsigned long)crit, (unsigned long)high, (unsigned long)warn, (unsigned long)info,
+                     (unsigned long)health.slots_in_use,
+                     Security_IsReady() ? "true" : "false");
+    if (n <= 0 || n >= (int)sizeof(body))
+    {
+        return;
+    }
+
+    int r = snprintf(response, sizeof(response),
+                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                     n, body);
+    if (r > 0 && r < (int)sizeof(response))
+    {
+        send_response(pcb, response);
     }
 }
 
@@ -974,6 +1118,7 @@ static void do_storage_complete(void *ctx)
     switch ((StorageOp_t)req->op)
     {
     case STORAGE_OP_ALERT_HISTORY:
+    case STORAGE_OP_ALERT_PAGE:
     {
         if (buf_idx < 0)
         {
@@ -990,9 +1135,33 @@ static void do_storage_complete(void *ctx)
 
         char *body_start = s_alert_resp_buffers[buf_idx] + 256;
         int body_offset = (int)req->out_used;
-        int tail = snprintf(&body_start[body_offset], 64,
-                            "],\"count\":%lu}", (unsigned long)req->records_read);
-        if (tail <= 0 || tail >= 64)
+        int tail;
+        if (req->op == STORAGE_OP_ALERT_PAGE)
+        {
+            if (req->has_more)
+            {
+                tail = snprintf(&body_start[body_offset], 96,
+                                "],\"count\":%lu,\"order\":\"newest\",\"has_more\":true,"
+                                "\"next_cursor\":%lu}",
+                                (unsigned long)req->records_read,
+                                (unsigned long)req->cursor_out);
+            }
+            else
+            {
+                tail = snprintf(&body_start[body_offset], 96,
+                                "],\"count\":%lu,\"order\":\"newest\",\"has_more\":false,"
+                                "\"next_cursor\":null}",
+                                (unsigned long)req->records_read);
+            }
+        }
+        else
+        {
+            tail = snprintf(&body_start[body_offset], 96,
+                            "],\"count\":%lu,\"order\":\"oldest\",\"has_more\":false,"
+                            "\"next_cursor\":null}",
+                            (unsigned long)req->records_read);
+        }
+        if (tail <= 0 || tail >= 96)
         {
             release_alert_resp_buffer(buf_idx);
             send_json_error(pcb, "500 Internal Server Error", "{\"error\":\"internal\"}");
@@ -1082,6 +1251,11 @@ static void do_storage_complete(void *ctx)
     }
 
     default:
+        /* Never leak a reserved response buffer on an unknown operation. */
+        if (buf_idx >= 0)
+        {
+            release_alert_resp_buffer(buf_idx);
+        }
         api_close_conn(pcb, client);
         break;
     }
@@ -1428,6 +1602,15 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
             tcp_output(pcb);
 
             pbuf_free(p);
+            return ERR_OK;
+        }
+
+        if (strncmp(client->request, "GET /api/alerts/summary", 23) == 0)
+        {
+            tcp_recved(pcb, p->tot_len);
+            handle_get_alerts_summary(pcb);
+            pbuf_free(p);
+            api_close_conn(pcb, client);
             return ERR_OK;
         }
 

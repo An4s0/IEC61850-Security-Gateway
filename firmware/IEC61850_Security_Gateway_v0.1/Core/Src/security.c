@@ -11,9 +11,6 @@
 static uint32_t s_alert_counter = 0;
 static volatile bool s_counter_initialized = false;
 
-static osMutexId s_slots_mutex = NULL;
-osMutexDef(SecuritySlotsMutex);
-
 static osMutexId s_sd_file_mutex = NULL;
 osMutexDef(SecuritySDMutex);
 
@@ -28,17 +25,13 @@ static uint32_t s_total_warn = 0;
 static uint32_t s_total_info = 0;
 
 static FIL s_sd_file;
-static char s_json_line[512];
 static char s_read_buf[512];
 static char s_safe_details[160];
 static char s_safe_target[64];
 static char s_frame_ts_str[32];
 
-#define ALERT_TRACK_SLOTS 32
-
 typedef struct
 {
-    bool in_use;
     uint64_t sequence;
     Security_Protocol_t protocol;
     Security_Severity_t severity;
@@ -56,16 +49,44 @@ typedef struct
     char details[128];
 } AlertSlot_t;
 
-static AlertSlot_t s_slots[ALERT_TRACK_SLOTS];
-static AlertSlot_t s_flush_slot;
+/*
+ * Bounded alert pipeline.
+ *
+ * Producers (GOOSE/SV/MMS tasks) append to a fixed-size FIFO ring; the storage
+ * owner drains it in batches. The depth is sized from the measured worst burst
+ * (60 alerts delivered back-to-back by one simulator scenario) with a margin,
+ * and the batch commit keeps per-record FatFs overhead (open/sync/close) off
+ * the drain critical path. Nothing here is unbounded and no SD access ever
+ * happens from a producer or an ISR.
+ */
+#define ALERT_RING_CAPACITY     64
+#define ALERT_BATCH_MAX_RECORDS 16
+#define ALERT_BATCH_MAX_BYTES   4096
+#define ALERT_FLUSH_MAX_BATCHES 4
+
+static AlertSlot_t s_ring[ALERT_RING_CAPACITY];
+static volatile uint16_t s_ring_head = 0;
+static volatile uint16_t s_ring_tail = 0;
+static volatile uint16_t s_ring_count = 0;
 static uint64_t s_slot_sequence;
-static volatile int s_pending_index = -1;
-static FSIZE_t s_pending_offset;
-static int s_pending_length;
-static bool s_pending_issued;
-static bool s_pending_committed;
+
+static char s_batch_buf[ALERT_BATCH_MAX_BYTES];
+static volatile uint16_t s_batch_offsets[ALERT_BATCH_MAX_RECORDS + 1];
+static uint16_t s_batch_records = 0;
+static uint32_t s_batch_len = 0;
+static FSIZE_t s_batch_offset = 0;
+static bool s_batch_issued = false;
+
 static Security_Stats_t s_sec_stats = {0};
 #define SEC_STAT_INC(field) do { taskENTER_CRITICAL(); if (s_sec_stats.field != UINT32_MAX) s_sec_stats.field++; taskEXIT_CRITICAL(); } while (0)
+
+/**
+ * @brief Advances a ring index, wrapping at the configured capacity.
+ */
+static inline uint16_t ring_next(uint16_t index)
+{
+    return (uint16_t)((index + 1U) % ALERT_RING_CAPACITY);
+}
 
 /**
  * @brief Scans the alerts log file on the SD card to build checkpoint index and sync counters.
@@ -198,10 +219,6 @@ static void sync_last_alert_id_from_sd(void)
  */
 void Security_Init(void)
 {
-    if (s_slots_mutex == NULL)
-    {
-        s_slots_mutex = osMutexCreate(osMutex(SecuritySlotsMutex));
-    }
     if (s_sd_file_mutex == NULL)
     {
         s_sd_file_mutex = osMutexCreate(osMutex(SecuritySDMutex));
@@ -271,6 +288,14 @@ const char *Security_ProtocolToString(Security_Protocol_t proto)
 uint32_t Security_GetAlertCount(void)
 {
     return s_alert_record_count;
+}
+
+/**
+ * @brief Returns the depth of the bounded in-RAM alert pipeline.
+ */
+uint32_t Security_GetPipelineCapacity(void)
+{
+    return ALERT_RING_CAPACITY;
 }
 
 bool Security_IsReady(void)
@@ -414,21 +439,9 @@ bool Security_LogAlertToSD(const Security_AlertLog_t *alert)
 
     SEC_STAT_INC(alerts_attempted);
 
-    if (s_slots_mutex == NULL)
+    if (s_sd_file_mutex == NULL)
     {
         Security_Init();
-        if (s_slots_mutex == NULL)
-        {
-            SEC_STAT_INC(alerts_dropped);
-            return false;
-        }
-    }
-
-    if (osMutexWait(s_slots_mutex, 0) != osOK)
-    {
-        SEC_STAT_INC(alerts_dropped);
-        SEC_STAT_INC(alerts_dropped_mutex_busy);
-        return false;
     }
 
     uint32_t now = HAL_GetTick();
@@ -467,69 +480,205 @@ bool Security_LogAlertToSD(const Security_AlertLog_t *alert)
 
     const char *target_str = alert->target ? alert->target : "N/A";
 
-    AlertSlot_t *slot = NULL;
-    AlertSlot_t *free_slot = NULL;
-    for (int i = 0; i < ALERT_TRACK_SLOTS; i++)
+    AlertSlot_t slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.protocol = alert->protocol;
+    slot.severity = alert->severity;
+    slot.app_id = alert->app_id;
+    slot.vlan_id = alert->vlan_id;
+    slot.conf_rev = alert->conf_rev;
+    slot.st_num = alert->st_num;
+    slot.sq_num = alert->sq_num;
+    slot.timestamp_ms = alert->timestamp_ms ? alert->timestamp_ms : now;
+    slot.frame_timestamp_ms = alert->frame_timestamp_ms;
+    strncpy(slot.event_type, ev_type, sizeof(slot.event_type) - 1);
+    strncpy(slot.src_str, cur_src_str, sizeof(slot.src_str) - 1);
+    strncpy(slot.dst_str, cur_dst_str, sizeof(slot.dst_str) - 1);
+    strncpy(slot.target, target_str, sizeof(slot.target) - 1);
+    strncpy(slot.details, alert->details ? alert->details : "Anomaly detected",
+            sizeof(slot.details) - 1);
+
+    /* The insertion itself is a bounded copy under a short interrupt-disabled
+     * window, so a producer can never fail because another task holds a lock. */
+    bool accepted = false;
+    taskENTER_CRITICAL();
+    if (s_ring_count < ALERT_RING_CAPACITY)
     {
-        if (!s_slots[i].in_use)
-        {
-            free_slot = &s_slots[i];
-            break;
-        }
+        slot.sequence = ++s_slot_sequence;
+        s_ring[s_ring_head] = slot;
+        s_ring_head = ring_next(s_ring_head);
+        s_ring_count++;
+        s_sec_stats.slots_in_use = s_ring_count;
+        if (s_ring_count > s_sec_stats.slots_high_water)
+            s_sec_stats.slots_high_water = s_ring_count;
+        accepted = true;
     }
-    if (free_slot == NULL)
+    taskEXIT_CRITICAL();
+
+    if (!accepted)
     {
+        /* The pipeline is genuinely saturated: the storage device cannot keep
+         * up even with batch commits. The rejection is attributed, never silent. */
         SEC_STAT_INC(alerts_dropped);
         SEC_STAT_INC(alerts_dropped_buffer_full);
-        osMutexRelease(s_slots_mutex);
         return false;
     }
 
-    if (free_slot != NULL)
-    {
-        slot = free_slot;
-        slot->in_use = true;
-        slot->sequence = ++s_slot_sequence;
-        slot->protocol = alert->protocol;
-        slot->severity = alert->severity;
-        slot->app_id = alert->app_id;
-        slot->vlan_id = alert->vlan_id;
-        slot->conf_rev = alert->conf_rev;
-        slot->st_num = alert->st_num;
-        slot->sq_num = alert->sq_num;
-        slot->timestamp_ms = alert->timestamp_ms ? alert->timestamp_ms : now;
-        slot->frame_timestamp_ms = alert->frame_timestamp_ms;
-        strncpy(slot->event_type, ev_type, sizeof(slot->event_type) - 1);
-        slot->event_type[sizeof(slot->event_type) - 1] = '\0';
-        strncpy(slot->src_str, cur_src_str, sizeof(slot->src_str) - 1);
-        slot->src_str[sizeof(slot->src_str) - 1] = '\0';
-        strncpy(slot->dst_str, cur_dst_str, sizeof(slot->dst_str) - 1);
-        slot->dst_str[sizeof(slot->dst_str) - 1] = '\0';
-        strncpy(slot->target, target_str, sizeof(slot->target) - 1);
-        slot->target[sizeof(slot->target) - 1] = '\0';
-        strncpy(slot->details, alert->details ? alert->details : "Anomaly detected", sizeof(slot->details) - 1);
-        slot->details[sizeof(slot->details) - 1] = '\0';
+    SEC_STAT_INC(alerts_generated);
+    return true;
+}
 
-        SEC_STAT_INC(alerts_generated);
+/**
+ * @brief Compares an interrupted batch against the file tail and repairs it.
+ *
+ * A previous attempt may have written all, part, or none of the batch before
+ * failing. Only a matching prefix is repaired (by truncation); anything else is
+ * reported as an error so a corrupted tail is investigated rather than
+ * overwritten.
+ * @return FR_OK when the batch may be (re)written.
+ */
+static FRESULT reconcile_batch(FIL *file)
+{
+    FSIZE_t size = f_size(file);
+    if (size < s_batch_offset)
+        return FR_INT_ERR;
+
+    if (size == s_batch_offset)
+    {
+        s_batch_issued = false; /* nothing reached the file */
+        return FR_OK;
+    }
+
+    FSIZE_t pending = size - s_batch_offset;
+    if (pending > (FSIZE_t)s_batch_len)
+        return FR_INT_ERR; /* data beyond this batch: do not touch it */
+
+    FRESULT res = f_lseek(file, s_batch_offset);
+    if (res != FR_OK)
+        return res;
+
+    FSIZE_t checked = 0;
+    while (checked < pending)
+    {
+        UINT want = (UINT)(((pending - checked) > (FSIZE_t)sizeof(s_read_buf))
+                               ? (FSIZE_t)sizeof(s_read_buf)
+                               : (pending - checked));
+        UINT got = 0;
+        res = f_read(file, s_read_buf, want, &got);
+        if (res != FR_OK)
+            return res;
+        if (got != want || memcmp(s_read_buf, &s_batch_buf[checked], want) != 0)
+            return FR_INT_ERR;
+        checked += (FSIZE_t)got;
+    }
+
+    res = f_lseek(file, s_batch_offset);
+    if (res != FR_OK)
+        return res;
+    res = f_truncate(file);
+    if (res != FR_OK)
+        return res;
+
+    s_batch_issued = false;
+    return f_sync(file);
+}
+
+/**
+ * @brief Formats the oldest ring entries into the batch buffer.
+ * @param first_alert_id Identifier to assign to the first record of the batch.
+ */
+static void build_batch(uint32_t first_alert_id)
+{
+    uint16_t count = 0;
+    uint32_t len = 0;
+    uint16_t index = s_ring_tail;
+
+    s_batch_offsets[0] = 0;
+
+    while (count < ALERT_BATCH_MAX_RECORDS && count < s_ring_count)
+    {
+        size_t room = (size_t)(ALERT_BATCH_MAX_BYTES - len);
+        int written = format_alert_json(&s_ring[index], first_alert_id + count,
+                                        &s_batch_buf[len], room);
+        if (written <= 0 || (size_t)written >= room)
+            break;
+        len += (uint32_t)written;
+        count++;
+        s_batch_offsets[count] = (uint16_t)len;
+        index = ring_next(index);
+    }
+
+    s_batch_records = count;
+    s_batch_len = len;
+}
+
+/**
+ * @brief Retires a committed batch: accounting, ring release and SSE delivery.
+ *
+ * The entries are read from the ring because the tail only advances here, and a
+ * full ring rejects new producers instead of overwriting unread records.
+ */
+static void commit_batch(void)
+{
+    for (uint16_t i = 0; i < s_batch_records; i++)
+    {
+        const AlertSlot_t *slot = &s_ring[s_ring_tail];
+
+        s_alert_counter++;
+        s_alert_record_count++;
+
+        if (slot->protocol == SEC_PROTO_GOOSE)
+            s_total_goose++;
+        else if (slot->protocol == SEC_PROTO_SV)
+            s_total_sv++;
+        else if (slot->protocol == SEC_PROTO_MMS)
+            s_total_mms++;
+
+        if (slot->severity == SEC_SEV_CRITICAL)
+            s_total_crit++;
+        else if (slot->severity == SEC_SEV_HIGH)
+            s_total_high++;
+        else if (slot->severity == SEC_SEV_WARNING)
+            s_total_warn++;
+        else if (slot->severity == SEC_SEV_INFO)
+            s_total_info++;
+
+        SEC_STAT_INC(alerts_written);
+
         taskENTER_CRITICAL();
-        s_sec_stats.slots_in_use++;
-        if (s_sec_stats.slots_in_use > s_sec_stats.slots_high_water)
-            s_sec_stats.slots_high_water = s_sec_stats.slots_in_use;
+        s_ring_tail = ring_next(s_ring_tail);
+        if (s_ring_count > 0)
+            s_ring_count--;
+        s_sec_stats.slots_in_use = s_ring_count;
         taskEXIT_CRITICAL();
     }
 
-    osMutexRelease(s_slots_mutex);
-    return true;
+    /* Broadcast only after the records are durable and the ring is released. */
+    for (uint16_t i = 0; i < s_batch_records; i++)
+    {
+        uint16_t offset = s_batch_offsets[i];
+        uint16_t length = (uint16_t)(s_batch_offsets[i + 1U] - offset);
+        HTTP_API_BroadcastAlert(&s_batch_buf[offset], length);
+    }
+
+    s_batch_records = 0;
+    s_batch_len = 0;
+    s_batch_issued = false;
 }
 
 /**
  * @brief Periodically flushes pending alert records to SD and SSE.
  *        Executes in low-priority background task (defaultTask).
  *        Preemptible by high-priority real-time packet tasks (SV, GOOSE, MMS).
+ *
+ * Drains the ring in batches, keeping one file session open across up to
+ * ALERT_FLUSH_MAX_BATCHES commits so that a burst costs one open/sync/close per
+ * batch instead of per record. Records are only released after a successful
+ * write and synchronisation, so a storage failure never destroys an alert.
  */
 void Security_PeriodicFlush(void)
 {
-    if (s_sd_file_mutex == NULL || s_slots_mutex == NULL)
+    if (s_sd_file_mutex == NULL)
         return;
 
     if (!s_counter_initialized)
@@ -542,170 +691,83 @@ void Security_PeriodicFlush(void)
             return;
     }
 
-    for (int batch = 0; batch < ALERT_TRACK_SLOTS; batch++)
+    if (!s_batch_issued)
     {
-        if (s_pending_index < 0)
-        {
-            SystemConfig_t sys_cfg;
-            SystemConfig_Get(&sys_cfg);
-            if (!sys_cfg.alerts.sd_logging_enabled)
-                return;
-
-            if (osMutexWait(s_slots_mutex, 10) != osOK)
-                return;
-
-            int oldest = -1;
-            for (int i = 0; i < ALERT_TRACK_SLOTS; i++)
-            {
-                if (s_slots[i].in_use &&
-                    (oldest < 0 || s_slots[i].sequence < s_slots[oldest].sequence))
-                    oldest = i;
-            }
-            if (oldest >= 0)
-            {
-                s_pending_index = oldest;
-                s_flush_slot = s_slots[oldest];
-                s_pending_issued = false;
-                s_pending_committed = false;
-            }
-            osMutexRelease(s_slots_mutex);
-            if (oldest < 0)
-                return;
-        }
-
-        if (!s_pending_committed)
-        {
-            if (osMutexWait(s_sd_file_mutex, 0) != osOK)
-                return;
-
-            if (!s_counter_initialized)
-                sync_last_alert_id_from_sd();
-            if (!s_counter_initialized || s_alert_counter == UINT32_MAX)
-            {
-                SEC_STAT_INC(storage_errors);
-                osMutexRelease(s_sd_file_mutex);
-                return;
-            }
-
-            s_pending_length = format_alert_json(&s_flush_slot, s_alert_counter + 1U,
-                                                s_json_line, sizeof(s_json_line));
-            if (s_pending_length <= 0 || (size_t)s_pending_length >= sizeof(s_json_line))
-            {
-                SEC_STAT_INC(storage_errors);
-                osMutexRelease(s_sd_file_mutex);
-                return;
-            }
-
-            memset(&s_sd_file, 0, sizeof(s_sd_file));
-            FRESULT res = f_open(&s_sd_file, SECURITY_ALERTS_FILE, FA_OPEN_ALWAYS | FA_READ | FA_WRITE);
-            if (res != FR_OK)
-            {
-                SEC_STAT_INC(storage_errors);
-                osMutexRelease(s_sd_file_mutex);
-                return;
-            }
-
-            if (s_pending_issued)
-            {
-                SEC_STAT_INC(persistence_retries);
-                FSIZE_t size = f_size(&s_sd_file);
-                FSIZE_t end = s_pending_offset + (FSIZE_t)s_pending_length;
-                if (size < s_pending_offset || size > end)
-                    res = FR_INT_ERR;
-                else if (size > s_pending_offset)
-                {
-                    UINT read_len = 0;
-                    UINT expected = (UINT)(size - s_pending_offset);
-                    res = f_lseek(&s_sd_file, s_pending_offset);
-                    if (res == FR_OK)
-                        res = f_read(&s_sd_file, s_read_buf, expected, &read_len);
-                    if (res == FR_OK && (read_len != expected ||
-                                         memcmp(s_read_buf, s_json_line, expected) != 0))
-                        res = FR_INT_ERR;
-                    if (res == FR_OK && size == end)
-                    {
-                        res = f_sync(&s_sd_file);
-                        if (res == FR_OK)
-                            s_pending_committed = true;
-                    }
-                    else if (res == FR_OK)
-                    {
-                        res = f_lseek(&s_sd_file, s_pending_offset);
-                        if (res == FR_OK)
-                            res = f_truncate(&s_sd_file);
-                        if (res == FR_OK)
-                            res = f_sync(&s_sd_file);
-                        if (res == FR_OK)
-                            s_pending_issued = false;
-                    }
-                }
-                else
-                    s_pending_issued = false;
-            }
-
-            if (res == FR_OK && !s_pending_issued && !s_pending_committed)
-            {
-                s_pending_offset = f_size(&s_sd_file);
-                res = f_lseek(&s_sd_file, s_pending_offset);
-                if (res == FR_OK)
-                {
-                    UINT written = 0;
-                    s_pending_issued = true;
-                    res = f_write(&s_sd_file, s_json_line, (UINT)s_pending_length, &written);
-                    if (res == FR_OK && written != (UINT)s_pending_length)
-                        res = FR_DISK_ERR;
-                    if (res == FR_OK)
-                        res = f_sync(&s_sd_file);
-                    if (res == FR_OK)
-                        s_pending_committed = true;
-                }
-            }
-
-            if (res != FR_OK)
-                SEC_STAT_INC(storage_errors);
-            if (f_close(&s_sd_file) != FR_OK)
-                SEC_STAT_INC(storage_errors);
-            memset(&s_sd_file, 0, sizeof(s_sd_file));
-
-            if (s_pending_committed)
-            {
-                s_alert_counter++;
-                s_alert_record_count++;
-                if (s_flush_slot.protocol == SEC_PROTO_GOOSE)
-                    s_total_goose++;
-                else if (s_flush_slot.protocol == SEC_PROTO_SV)
-                    s_total_sv++;
-                else if (s_flush_slot.protocol == SEC_PROTO_MMS)
-                    s_total_mms++;
-
-                if (s_flush_slot.severity == SEC_SEV_CRITICAL)
-                    s_total_crit++;
-                else if (s_flush_slot.severity == SEC_SEV_HIGH)
-                    s_total_high++;
-                else if (s_flush_slot.severity == SEC_SEV_WARNING)
-                    s_total_warn++;
-                else if (s_flush_slot.severity == SEC_SEV_INFO)
-                    s_total_info++;
-                SEC_STAT_INC(alerts_written);
-            }
-            osMutexRelease(s_sd_file_mutex);
-            if (!s_pending_committed)
-                return;
-        }
-
-        if (osMutexWait(s_slots_mutex, 10) != osOK)
+        SystemConfig_t sys_cfg;
+        SystemConfig_Get(&sys_cfg);
+        if (!sys_cfg.alerts.sd_logging_enabled)
             return;
-        s_slots[s_pending_index].in_use = false;
-        taskENTER_CRITICAL();
-        if (s_sec_stats.slots_in_use > 0)
-            s_sec_stats.slots_in_use--;
-        taskEXIT_CRITICAL();
-        s_pending_index = -1;
-        s_pending_committed = false;
-        s_pending_issued = false;
-        osMutexRelease(s_slots_mutex);
+    }
 
-        HTTP_API_BroadcastAlert(s_json_line, (uint16_t)s_pending_length);
+    for (int pass = 0; pass < ALERT_FLUSH_MAX_BATCHES; pass++)
+    {
+        if (!s_batch_issued && s_ring_count == 0)
+            return;
+
+        if (s_alert_counter == UINT32_MAX)
+        {
+            SEC_STAT_INC(storage_errors);
+            return;
+        }
+
+        if (!s_batch_issued && s_batch_records == 0)
+        {
+            build_batch(s_alert_counter + 1U);
+            if (s_batch_records == 0)
+                return;
+        }
+
+        if (osMutexWait(s_sd_file_mutex, 0) != osOK)
+            return;
+
+        memset(&s_sd_file, 0, sizeof(s_sd_file));
+        FRESULT res = f_open(&s_sd_file, SECURITY_ALERTS_FILE,
+                             FA_OPEN_ALWAYS | FA_READ | FA_WRITE);
+        if (res != FR_OK)
+        {
+            SEC_STAT_INC(storage_errors);
+            osMutexRelease(s_sd_file_mutex);
+            return;
+        }
+
+        if (s_batch_issued)
+        {
+            SEC_STAT_INC(persistence_retries);
+            res = reconcile_batch(&s_sd_file);
+        }
+
+        if (res == FR_OK)
+        {
+            if (!s_batch_issued)
+            {
+                s_batch_offset = f_size(&s_sd_file);
+            }
+            res = f_lseek(&s_sd_file, s_batch_offset);
+        }
+
+        if (res == FR_OK)
+        {
+            UINT written = 0;
+            s_batch_issued = true;
+            res = f_write(&s_sd_file, s_batch_buf, (UINT)s_batch_len, &written);
+            if (res == FR_OK && written != (UINT)s_batch_len)
+                res = FR_DISK_ERR;
+        }
+
+        if (res == FR_OK)
+            res = f_sync(&s_sd_file);
+
+        FRESULT close_res = f_close(&s_sd_file);
+        memset(&s_sd_file, 0, sizeof(s_sd_file));
+        osMutexRelease(s_sd_file_mutex);
+
+        if (res != FR_OK || close_res != FR_OK)
+        {
+            SEC_STAT_INC(storage_errors);
+            return; /* records remain pending and are retried on the next call */
+        }
+
+        commit_batch();
     }
 }
 
@@ -714,21 +776,18 @@ void Security_PeriodicFlush(void)
  */
 bool Security_ClearAlertsOnSD(void)
 {
-    if (s_slots_mutex == NULL || s_sd_file_mutex == NULL)
+    if (s_sd_file_mutex == NULL)
     {
         Security_Init();
     }
 
-    if (s_slots_mutex == NULL || s_sd_file_mutex == NULL)
+    if (s_sd_file_mutex == NULL)
         return false;
 
-    if (s_sd_file_mutex != NULL)
-    {
-        if (osMutexWait(s_sd_file_mutex, 50) != osOK)
-            return false;
-    }
+    if (osMutexWait(s_sd_file_mutex, 50) != osOK)
+        return false;
 
-    if (s_pending_index >= 0)
+    if (Security_HasPendingAlert())
     {
         osMutexRelease(s_sd_file_mutex);
         return false;
@@ -770,46 +829,28 @@ bool Security_ClearAlertsOnSD(void)
 }
 
 /**
- * @brief Reports whether a record is currently being committed to SD.
+ * @brief Reports whether any alert is still awaiting persistence.
  *        Used by the storage owner before it truncates the alert log.
  */
 bool Security_HasPendingAlert(void)
 {
-    return (s_pending_index >= 0);
+    return (s_ring_count > 0) || s_batch_issued;
 }
 
 /**
- * @brief Discards every RAM alert slot that has not been committed yet.
+ * @brief Discards every alert that has not been committed yet.
  *        Caller must ensure no record is in flight (see Security_HasPendingAlert).
- * @return number of discarded slots.
+ * @return number of discarded records.
  */
 uint32_t Security_PurgePendingAlerts(void)
 {
-    if (s_slots_mutex == NULL)
-    {
-        return 0;
-    }
-    if (osMutexWait(s_slots_mutex, 50) != osOK)
-    {
-        return 0;
-    }
-
-    uint32_t purged = 0;
-    for (int i = 0; i < ALERT_TRACK_SLOTS; i++)
-    {
-        if (s_slots[i].in_use)
-        {
-            s_slots[i].in_use = false;
-            purged++;
-        }
-    }
-
-    s_pending_index = -1;
-    s_pending_issued = false;
-    s_pending_committed = false;
-    s_pending_length = 0;
+    uint32_t purged;
 
     taskENTER_CRITICAL();
+    purged = s_ring_count;
+    s_ring_head = 0;
+    s_ring_tail = 0;
+    s_ring_count = 0;
     s_sec_stats.slots_in_use = 0;
     if (purged != 0U)
     {
@@ -817,7 +858,10 @@ uint32_t Security_PurgePendingAlerts(void)
     }
     taskEXIT_CRITICAL();
 
-    osMutexRelease(s_slots_mutex);
+    s_batch_records = 0;
+    s_batch_len = 0;
+    s_batch_issued = false;
+
     return purged;
 }
 
