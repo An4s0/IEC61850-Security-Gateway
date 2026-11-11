@@ -6,6 +6,8 @@
 #include "ff.h"
 #include "cmsis_os.h"
 #include "stm32f7xx_hal.h"
+#include "sdmmc.h"
+#include "user_diskio.h"
 #include <string.h>
 
 #define STORAGE_HISTORY_LINE_MAX 512
@@ -15,6 +17,12 @@
 #define STORAGE_LOCK_TIMEOUT_MS 1000
 #define STORAGE_CLEAR_DRAIN_MS 2000
 
+#define SD_MEDIA_POLL_MS 200U
+#define SD_MEDIA_DEBOUNCE_SAMPLES 3U
+#define SD_MEDIA_REMOUNT_RETRY_MS 2000U
+#define SD_MEDIA_REMOUNT_MAX_TRIES 5U
+#define SD_MEDIA_LOCK_TIMEOUT_MS 500U
+
 osMessageQDef(StorageServiceQueue, STORAGE_QUEUE_DEPTH, uint32_t);
 
 static osMessageQId s_queue = NULL;
@@ -22,14 +30,33 @@ static StorageRequest_t s_requests[STORAGE_MAX_REQUESTS];
 static StorageCompleteHook_t s_complete_hook = NULL;
 static StorageService_Stats_t s_stats;
 
+typedef struct
+{
+    bool initialized;
+    bool drive_ready;
+    bool pin_raw;
+    bool pin_present;
+    uint32_t pin_stable;
+    bool mounted;
+    uint32_t last_poll_ms;
+    uint32_t last_attempt_ms;
+    uint32_t tries;
+    uint32_t removals;
+    uint32_t insertions;
+    uint32_t faults;
+    uint32_t recoveries;
+    uint32_t attempts;
+    uint32_t succeeded;
+    uint32_t failed;
+    uint32_t verify_failures;
+    uint32_t lock_timeouts;
+} SdMediaState_t;
+
+static SdMediaState_t s_media;
+
 static char s_history_line[STORAGE_HISTORY_LINE_MAX];
 static char s_filter_prefix[STORAGE_FILTER_PREFIX];
 
-/*
- * Filter patterns are matched against the fixed prefix of a stored record
- * ("proto" and "sev" are emitted before any free-text field), so a filtered
- * scan only needs the first STORAGE_FILTER_PREFIX bytes of each line.
- */
 static const char *const s_proto_patterns[] = {
     NULL, "\"proto\":\"GOOSE\"", "\"proto\":\"SV\"", "\"proto\":\"MMS\""};
 static const char *const s_sev_patterns[] = {
@@ -38,6 +65,9 @@ static const char *const s_sev_patterns[] = {
 
 /**
  * @brief Tests one NUL-terminated record prefix against the request filters.
+ * @param text Record prefix to test.
+ * @param req Request carrying the protocol and severity filters.
+ * @return true when the record passes both filters, false when it is excluded.
  */
 static bool alert_prefix_matches(const char *text, const StorageRequest_t *req)
 {
@@ -66,6 +96,14 @@ static bool alert_prefix_matches(const char *text, const StorageRequest_t *req)
  * @brief Tests one stored record against the request filters, reading only the
  *        fixed prefix that carries the "proto" and "sev" fields.
  *        Executes in the storage-owner task with the log file already open.
+ * @param file Open alert log.
+ * @param blk Block currently cached from the log.
+ * @param blk_start File offset of blk[0].
+ * @param blk_len Number of valid bytes in blk.
+ * @param start File offset of the record.
+ * @param len Record length in bytes.
+ * @param req Request carrying the filters.
+ * @return true when the record passes the filters, false when excluded or unreadable.
  */
 static bool alert_record_matches(FIL *file, const char *blk, uint32_t blk_start,
                                  UINT blk_len, uint32_t start, uint32_t len,
@@ -100,6 +138,10 @@ static bool alert_record_matches(FIL *file, const char *blk, uint32_t blk_start,
     return alert_prefix_matches(s_filter_prefix, req);
 }
 
+/**
+ * @brief Increments a statistics counter without wrapping.
+ * @param field Counter to increment, saturated at UINT32_MAX.
+ */
 static void storage_stat_inc(uint32_t *field)
 {
     taskENTER_CRITICAL();
@@ -110,6 +152,9 @@ static void storage_stat_inc(uint32_t *field)
     taskEXIT_CRITICAL();
 }
 
+/**
+ * @brief Creates the storage request queue and clears the service statistics.
+ */
 void StorageService_Init(void)
 {
     if (s_queue == NULL)
@@ -119,11 +164,19 @@ void StorageService_Init(void)
     memset(&s_stats, 0, sizeof(s_stats));
 }
 
+/**
+ * @brief Installs the callback invoked when a request completes.
+ * @param hook Completion hook, or NULL to release completed requests directly.
+ */
 void StorageService_SetCompleteHook(StorageCompleteHook_t hook)
 {
     s_complete_hook = hook;
 }
 
+/**
+ * @brief Reserves a free request slot and marks it pending.
+ * @return Pointer to the reserved request, or NULL when every slot is in use.
+ */
 StorageRequest_t *StorageService_Acquire(void)
 {
     StorageRequest_t *found = NULL;
@@ -144,6 +197,11 @@ StorageRequest_t *StorageService_Acquire(void)
     return found;
 }
 
+/**
+ * @brief Queues a reserved request for execution by the storage-owner task.
+ * @param req Request previously obtained from StorageService_Acquire().
+ * @return true when queued, false when the request is invalid or the queue is full.
+ */
 bool StorageService_Submit(StorageRequest_t *req)
 {
     if (req == NULL || s_queue == NULL)
@@ -163,6 +221,10 @@ bool StorageService_Submit(StorageRequest_t *req)
     return true;
 }
 
+/**
+ * @brief Returns a request slot to the free pool.
+ * @param req Request to release; ignored when NULL.
+ */
 void StorageService_Release(StorageRequest_t *req)
 {
     if (req == NULL)
@@ -177,6 +239,10 @@ void StorageService_Release(StorageRequest_t *req)
     taskEXIT_CRITICAL();
 }
 
+/**
+ * @brief Raises the recorded queue-depth high-water mark.
+ * @param depth Observed queue depth.
+ */
 void StorageService_SetQueueHighWater(uint32_t depth)
 {
     taskENTER_CRITICAL();
@@ -187,6 +253,10 @@ void StorageService_SetQueueHighWater(uint32_t depth)
     taskEXIT_CRITICAL();
 }
 
+/**
+ * @brief Copies the service statistics out atomically.
+ * @param out Destination structure; ignored when NULL.
+ */
 void StorageService_GetStats(StorageService_Stats_t *out)
 {
     if (out == NULL)
@@ -199,8 +269,203 @@ void StorageService_GetStats(StorageService_Stats_t *out)
 }
 
 /**
+ * @brief Reports SD media state, combining the disk driver counters with the media supervisor state.
+ * @param out Destination structure; ignored when NULL.
+ */
+void StorageService_GetMediaStats(StorageService_MediaStats_t *out)
+{
+    USER_DiskioStats_t disk;
+    if (out == NULL)
+    {
+        return;
+    }
+    USER_Diskio_GetStats(&disk);
+    taskENTER_CRITICAL();
+    out->card_present = SDMMC_IsCardInserted() ? 1U : 0U;
+    out->drive_ready = disk.not_ready ? 0U : 1U;
+    out->mounted = s_media.mounted ? 1U : 0U;
+    out->removals = s_media.removals;
+    out->insertions = s_media.insertions;
+    out->drive_faults = s_media.faults;
+    out->drive_recoveries = s_media.recoveries;
+    out->remount_attempts = s_media.attempts;
+    out->remount_ok = s_media.succeeded;
+    out->remount_fail = s_media.failed;
+    out->verify_failures = s_media.verify_failures;
+    out->disk_init_attempts = disk.init_attempts;
+    out->disk_init_failures = disk.init_failures;
+    taskEXIT_CRITICAL();
+}
+
+/**
+ * @brief Drops the FatFs mount so no reader keeps stale volume state.
+ *
+ * Only the file-system object is invalidated; the volume stays registered,
+ * because an unregistered volume makes every later file call return
+ * FR_NOT_ENABLED without ever re-initialising the card. Keeping it registered is
+ * what lets FatFs retry disk_initialize() and recover the card.
+ */
+static void sd_media_invalidate(void)
+{
+    if (Security_LockSD(SD_MEDIA_LOCK_TIMEOUT_MS))
+    {
+        (void)f_mount(&USERFatFS, (TCHAR const *)USERPath, 0);
+        Security_UnlockSD();
+    }
+    s_media.mounted = false;
+    s_media.tries = 0;
+}
+
+/**
+ * @brief Unmounts, remounts and verifies the volume before writes may resume.
+ *        Called from the storage-owner task only.
+ */
+static void sd_media_try_mount(void)
+{
+    s_media.attempts++;
+    s_media.last_attempt_ms = HAL_GetTick();
+
+    if (!Security_LockSD(SD_MEDIA_LOCK_TIMEOUT_MS))
+    {
+        s_media.failed++;
+        s_media.tries++;
+        s_media.lock_timeouts++;
+        return;
+    }
+
+    FRESULT res = f_mount(&USERFatFS, (TCHAR const *)USERPath, 1);
+    if (res == FR_OK)
+    {
+        DIR dir;
+        memset(&dir, 0, sizeof(dir));
+        res = f_opendir(&dir, "/");
+        if (res == FR_OK)
+        {
+            (void)f_closedir(&dir);
+        }
+        else
+        {
+            s_media.verify_failures++;
+            (void)f_mount(&USERFatFS, (TCHAR const *)USERPath, 0);
+        }
+    }
+
+    Security_UnlockSD();
+
+    if (res == FR_OK)
+    {
+        s_media.mounted = true;
+        s_media.succeeded++;
+        s_media.tries = SD_MEDIA_REMOUNT_MAX_TRIES;
+    }
+    else
+    {
+        s_media.mounted = false;
+        s_media.failed++;
+        s_media.tries++;
+    }
+
+    SysLog_Print((res == FR_OK) ? SYSLOG_LEVEL_INFO : SYSLOG_LEVEL_WARN, "SD",
+                 "Storage remount %s (attempt %lu, failures=%lu, res=%d)",
+                 (res == FR_OK) ? "succeeded" : "failed",
+                 (unsigned long)s_media.attempts, (unsigned long)s_media.failed,
+                 (int)res);
+}
+
+/**
+ * @brief Supervises SD media presence: detection, remount and bounded retry.
+ *
+ * Runs in the storage-owner task. Never called from an interrupt, the RX path or
+ * a lwIP callback, so FatFs access stays single-threaded by construction.
+ *
+ * Two independent detectors are used: the debounced card-detect switch (fast,
+ * but only an optimisation) and the drive state reported by user_diskio.c, which
+ * marks the drive STA_NOINIT after any failed transfer. Recovery depends on
+ * neither alone: the mount attempts below re-run the card initialisation, so a
+ * card that returns is picked up even if the switch never reports an edge.
+ */
+void StorageService_MediaService(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if ((now - s_media.last_poll_ms) < SD_MEDIA_POLL_MS)
+    {
+        return;
+    }
+    s_media.last_poll_ms = now;
+
+    bool ready = USER_Diskio_IsReady();
+    bool pin_present = SDMMC_IsCardInserted();
+
+    if (!s_media.initialized)
+    {
+        s_media.initialized = true;
+        s_media.drive_ready = ready;
+        s_media.pin_raw = pin_present;
+        s_media.pin_present = pin_present;
+        s_media.mounted = false;
+        s_media.tries = 0;
+    }
+
+    if (pin_present != s_media.pin_raw)
+    {
+        s_media.pin_raw = pin_present;
+        s_media.pin_stable = 0;
+    }
+    else if (s_media.pin_stable < SD_MEDIA_DEBOUNCE_SAMPLES)
+    {
+        s_media.pin_stable++;
+    }
+    else if (pin_present != s_media.pin_present)
+    {
+        s_media.pin_present = pin_present;
+        s_media.tries = 0;
+
+        if (pin_present)
+        {
+            s_media.insertions++;
+        }
+        else
+        {
+            s_media.removals++;
+            sd_media_invalidate();
+            SysLog_Print(SYSLOG_LEVEL_WARN, "SD",
+                         "SD card removed; pending alerts kept in RAM (removals=%lu)",
+                         (unsigned long)s_media.removals);
+        }
+    }
+
+    if (ready != s_media.drive_ready)
+    {
+        s_media.drive_ready = ready;
+
+        if (ready)
+        {
+            s_media.recoveries++;
+            s_media.tries = 0;
+        }
+        else
+        {
+            s_media.faults++;
+            sd_media_invalidate();
+        }
+    }
+
+    if (s_media.mounted || (s_media.tries >= SD_MEDIA_REMOUNT_MAX_TRIES) ||
+        ((s_media.tries != 0U) && ((now - s_media.last_attempt_ms) < SD_MEDIA_REMOUNT_RETRY_MS)))
+    {
+        return;
+    }
+
+    sd_media_try_mount();
+}
+
+/**
  * @brief Appends matching NDJSON records from the alert log to the request buffer.
  *        Executes exclusively in the storage-owner task.
+ * @param req Request supplying the output buffer, filters, offset and limit.
+ * @return true when the scan completed (an absent log counts as an empty history),
+ *         false on lock or access error.
  */
 static bool storage_do_alert_history(StorageRequest_t *req)
 {
@@ -221,7 +486,6 @@ static bool storage_do_alert_history(StorageRequest_t *req)
     if (res != FR_OK)
     {
         Security_UnlockSD();
-        /* A missing log is an empty history, not a failure. */
         req->records_read = 0;
         return (res == FR_NO_FILE || res == FR_NO_PATH);
     }
@@ -272,7 +536,7 @@ static bool storage_do_alert_history(StorageRequest_t *req)
         {
             if (read > 0)
             {
-                off--; /* drop the separator we just added */
+                off--;
             }
             break;
         }
@@ -302,6 +566,8 @@ static bool storage_do_alert_history(StorageRequest_t *req)
  * work and never loads the whole history. The cursor returned to the client is
  * the byte offset of the oldest record in the page, which stays valid while new
  * records are appended at the end.
+ * @param req Request carrying cursor_in, filters, limit and the output buffer.
+ * @return true when the page was produced, false on lock or access error.
  */
 static bool storage_do_alert_page(StorageRequest_t *req)
 {
@@ -331,7 +597,6 @@ static bool storage_do_alert_page(StorageRequest_t *req)
         req->records_read = 0;
         req->cursor_out = 0;
         req->has_more = 0;
-        /* Leave out_used untouched so the caller still emits a valid empty page. */
         return (res == FR_NO_FILE || res == FR_NO_PATH);
     }
 
@@ -480,6 +745,9 @@ static bool storage_do_alert_page(StorageRequest_t *req)
 /**
  * @brief Clears the alert log. Drains any in-flight record first so that a
  *        record cannot be appended after the file has been truncated.
+ * @param req Unused request context.
+ * @return true when the log was cleared, false when pending records could not be drained
+ *         or the truncation failed.
  */
 static bool storage_do_alert_clear(StorageRequest_t *req)
 {
@@ -515,12 +783,22 @@ static bool storage_do_alert_clear(StorageRequest_t *req)
     return true;
 }
 
+/**
+ * @brief Persists the active configuration from the storage-owner task.
+ * @param req Unused request context.
+ * @return true when the configuration was written, false otherwise.
+ */
 static bool storage_do_config_save(StorageRequest_t *req)
 {
     (void)req;
     return SystemConfig_SaveToSD();
 }
 
+/**
+ * @brief Routes a request to the handler for its operation.
+ * @param req Request to execute.
+ * @return true when the handler reported success, false on failure or an unknown operation.
+ */
 static bool storage_dispatch(StorageRequest_t *req)
 {
     switch ((StorageOp_t)req->op)
@@ -538,10 +816,13 @@ static bool storage_dispatch(StorageRequest_t *req)
     }
 }
 
+/**
+ * @brief One iteration of the storage-owner task: supervise the media, flush logs and run one request.
+ */
 void StorageService_Run(void)
 {
-    /* Background maintenance keeps the alert and system logs drained; it is
-     * bounded by the SD mutex zero-wait policy inside the called functions. */
+    StorageService_MediaService();
+
     Security_PeriodicFlush();
 
     osEvent evt = osMessageGet(s_queue, 0);
@@ -581,7 +862,5 @@ void StorageService_Run(void)
 
     SysLog_PeriodicFlush();
 
-    /* Wake quickly while alerts are waiting so a burst is drained before the
-     * ring fills; otherwise keep the low-rate background cadence. */
     osDelay(Security_HasPendingAlert() ? 1 : 100);
 }

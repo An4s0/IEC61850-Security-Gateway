@@ -7,19 +7,31 @@ static volatile uint32_t s_last_sta = 0;
 volatile uint32_t g_last_read_count = 0;
 static SDMMC_Diagnostics_t s_diagnostics;
 
+/**
+ * @brief Increments a diagnostic counter without wrapping.
+ * @param value Counter to increment, saturated at UINT32_MAX.
+ */
 static void sdmmc_increment(uint32_t *value)
 {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     if (*value != UINT32_MAX)
+    {
         (*value)++;
+    }
     __set_PRIMASK(primask);
 }
 
+/**
+ * @brief Copies the SDMMC driver diagnostics to the caller.
+ * @param out Destination structure; ignored when NULL.
+ */
 void SDMMC_GetDiagnostics(SDMMC_Diagnostics_t *out)
 {
     if (out == NULL)
+    {
         return;
+    }
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     *out = s_diagnostics;
@@ -28,6 +40,8 @@ void SDMMC_GetDiagnostics(SDMMC_Diagnostics_t *out)
 
 /**
  * @brief Records the longest observed interrupt-disabled FIFO burst, in microseconds.
+ * @param start Tick count taken before interrupts were disabled.
+ * @param end Tick count taken after the burst completed.
  */
 static void sdmmc_record_irq_off(uint32_t start, uint32_t end)
 {
@@ -43,6 +57,7 @@ static void sdmmc_record_irq_off(uint32_t start, uint32_t end)
 
 /**
  * @brief Delays execution using the RTOS scheduler or a busy-wait loop.
+ * @param ms Delay in milliseconds.
  */
 static void sdmmc_delay_ms(uint32_t ms)
 {
@@ -129,6 +144,11 @@ static int sdmmc_wait_cmd(uint8_t respType)
     return SDMMC_ERR_TIMEOUT;
 }
 
+/**
+ * @brief Maps a driver error code to a printable description.
+ * @param err Error code returned by the SDMMC driver.
+ * @return Constant string description of the error.
+ */
 const char *SDMMC_ErrorString(int err)
 {
     switch (err)
@@ -164,6 +184,7 @@ const char *SDMMC_ErrorString(int err)
 
 /**
  * @brief Returns the last recorded SDMMC status register value.
+ * @return Last value captured from SDMMC1->STA.
  */
 uint32_t SDMMC_GetLastStatus(void)
 {
@@ -178,7 +199,8 @@ void SDMMC_GPIO_Init(void)
     RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
     HAL_EnableCompensationCell();
     while ((SYSCFG->CMPCR & SYSCFG_CMPCR_READY) == 0)
-        ;
+    {
+    }
 
     RCC->APB2ENR |= (1UL << 11);
     RCC->DCKCFGR2 &= ~(1UL << 28);
@@ -231,10 +253,17 @@ void SDMMC_CardDetect_Init(void)
 
 /**
  * @brief Checks whether an SD card is inserted.
+ *
+ * Measured on this board: the detect switch is HIGH with a card fitted and LOW
+ * with the socket empty, which is the opposite of the original assumption. Using
+ * the measured polarity is also the safe default, because an unconnected pin
+ * reads HIGH through its pull-up and is then treated as "card present", leaving
+ * media loss to be detected from transfer failures.
+ * @return true when a card is detected as present.
  */
 bool SDMMC_IsCardInserted(void)
 {
-    return (HAL_GPIO_ReadPin(SDMMC_DET_GPIO, SDMMC_DET_PIN) == GPIO_PIN_RESET);
+    return (HAL_GPIO_ReadPin(SDMMC_DET_GPIO, SDMMC_DET_PIN) == GPIO_PIN_SET);
 }
 
 /**
@@ -260,6 +289,7 @@ void SDMMC_PeripheralInit(void)
 
 /**
  * @brief Sets the SDMMC1 clock divider.
+ * @param div Divider written to SDMMC1->CLKCR.
  */
 void SDMMC_SetClockDiv(uint8_t div)
 {
@@ -271,6 +301,10 @@ void SDMMC_SetClockDiv(uint8_t div)
 
 /**
  * @brief Sends an SDMMC command and waits for its response.
+ * @param cmd Command index.
+ * @param arg Command argument.
+ * @param respType Expected response type (SDMMC_RESP_NONE/SHORT/LONG).
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_SendCmd(uint8_t cmd, uint32_t arg, uint8_t respType)
 {
@@ -285,6 +319,8 @@ int SDMMC_SendCmd(uint8_t cmd, uint32_t arg, uint8_t respType)
 
 /**
  * @brief Initializes the SD card and configures its operating parameters.
+ * @param info Card information structure filled in during initialization.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_CardInit(SD_CardInfo_t *info)
 {
@@ -299,7 +335,9 @@ int SDMMC_CardInit(SD_CardInfo_t *info)
 
     ret = SDMMC_SendCmd(SD_CMD0_GO_IDLE_STATE, 0x00000000, SDMMC_RESP_NONE);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
     sdmmc_delay_ms(5);
 
     SDMMC_SendCmd(SD_CMD0_GO_IDLE_STATE, 0x00000000, SDMMC_RESP_NONE);
@@ -338,37 +376,49 @@ int SDMMC_CardInit(SD_CardInfo_t *info)
 
     uint32_t acmd41_arg = 0x00FF8000U;
     if (info->CardType != SD_CARD_V1)
+    {
         acmd41_arg |= 0x40000000U;
+    }
 
     uint32_t start_tick = HAL_GetTick();
     while (1)
     {
         ret = SDMMC_SendCmd(SD_CMD55_APP_CMD, 0x00000000U, SDMMC_RESP_SHORT);
         if (ret != SDMMC_OK)
+        {
             return ret;
+        }
 
         ret = SDMMC_SendCmd(SD_ACMD41_SD_SEND_OP_COND, acmd41_arg, SDMMC_RESP_SHORT);
         if (ret != SDMMC_OK && ret != SDMMC_ERR_CMD_CRC)
+        {
             return ret;
+        }
 
         response = SDMMC1->RESP1;
         if (response & 0x80000000U)
         {
             info->OCR = response;
             if ((info->CardType != SD_CARD_V1) && (response & 0x40000000U))
+            {
                 info->CardType = SD_CARD_V2_HC;
+            }
             break;
         }
 
         if ((HAL_GetTick() - start_tick) > 2000)
+        {
             return SDMMC_ERR_TIMEOUT;
+        }
 
         sdmmc_delay_ms(10);
     }
 
     ret = SDMMC_SendCmd(SD_CMD2_ALL_SEND_CID, 0x00000000U, SDMMC_RESP_LONG);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     info->CID[0] = SDMMC1->RESP1;
     info->CID[1] = SDMMC1->RESP2;
@@ -377,23 +427,31 @@ int SDMMC_CardInit(SD_CardInfo_t *info)
 
     ret = SDMMC_SendCmd(SD_CMD3_SEND_RELATIVE_ADDR, 0x00000000U, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     info->RCA = (SDMMC1->RESP1 >> 16) & 0xFFFFU;
 
     ret = SDMMC_ReadCSD(info);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     SDMMC_ParseCSD(info);
 
     ret = SDMMC_SendCmd(SD_CMD7_SELECT_CARD, info->RCA << 16, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     ret = SDMMC_SendCmd(SD_CMD16_SET_BLOCKLEN, 512U, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     SDMMC_SetBusWidth4(info);
 
@@ -407,12 +465,16 @@ int SDMMC_CardInit(SD_CardInfo_t *info)
 
 /**
  * @brief Reads the Card-Specific Data (CSD) register from the SD card.
+ * @param info Card information structure that receives the CSD.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_ReadCSD(SD_CardInfo_t *info)
 {
     int ret = SDMMC_SendCmd(SD_CMD9_SEND_CSD, info->RCA << 16, SDMMC_RESP_LONG);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     info->CSD[0] = SDMMC1->RESP1;
     info->CSD[1] = SDMMC1->RESP2;
@@ -424,12 +486,16 @@ int SDMMC_ReadCSD(SD_CardInfo_t *info)
 
 /**
  * @brief Reads the Card Identification (CID) register from the SD card.
+ * @param info Card information structure that receives the CID.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_ReadCID(SD_CardInfo_t *info)
 {
     int ret = SDMMC_SendCmd(SD_CMD10_SEND_CID, info->RCA << 16, SDMMC_RESP_LONG);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     info->CID[0] = SDMMC1->RESP1;
     info->CID[1] = SDMMC1->RESP2;
@@ -441,6 +507,7 @@ int SDMMC_ReadCID(SD_CardInfo_t *info)
 
 /**
  * @brief Parses the CSD register to determine the card capacity and block count.
+ * @param info Card information holding the raw CSD to parse and receiving the derived values.
  */
 void SDMMC_ParseCSD(SD_CardInfo_t *info)
 {
@@ -471,6 +538,8 @@ void SDMMC_ParseCSD(SD_CardInfo_t *info)
 
 /**
  * @brief Configures the SD card and SDMMC peripheral for four-bit bus operation.
+ * @param info Card information structure of the initialized card.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_SetBusWidth4(SD_CardInfo_t *info)
 {
@@ -478,11 +547,15 @@ int SDMMC_SetBusWidth4(SD_CardInfo_t *info)
 
     ret = SDMMC_SendCmd(SD_CMD55_APP_CMD, info->RCA << 16, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     ret = SDMMC_SendCmd(SD_ACMD6_SET_BUS_WIDTH, 0x00000002U, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     uint32_t clkcr = SDMMC1->CLKCR;
     clkcr &= ~SDMMC_CLKCR_WIDBUS;
@@ -497,6 +570,8 @@ int SDMMC_SetBusWidth4(SD_CardInfo_t *info)
 
 /**
  * @brief Configures the SD card and SDMMC peripheral for one-bit bus operation.
+ * @param info Card information structure of the initialized card.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_SetBusWidth1(SD_CardInfo_t *info)
 {
@@ -504,11 +579,15 @@ int SDMMC_SetBusWidth1(SD_CardInfo_t *info)
 
     ret = SDMMC_SendCmd(SD_CMD55_APP_CMD, info->RCA << 16, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     ret = SDMMC_SendCmd(SD_ACMD6_SET_BUS_WIDTH, 0x00000000U, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     uint32_t clkcr = SDMMC1->CLKCR;
     clkcr &= ~SDMMC_CLKCR_WIDBUS;
@@ -522,18 +601,26 @@ int SDMMC_SetBusWidth1(SD_CardInfo_t *info)
 
 /**
  * @brief Retrieves the current status of the SD card.
+ * @param info Card information structure of the initialized card.
+ * @param status Output for the raw card status word.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_GetCardStatus(SD_CardInfo_t *info, uint32_t *status)
 {
     int ret = SDMMC_SendCmd(SD_CMD13_SEND_STATUS, info->RCA << 16, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
     *status = SDMMC1->RESP1;
     return SDMMC_OK;
 }
 
 /**
  * @brief Waits until the SD card enters the transfer state or the timeout expires.
+ * @param info Card information structure of the initialized card.
+ * @param timeout_ms Maximum time to wait, in milliseconds.
+ * @return SDMMC_OK when the card is ready, SDMMC_ERR_TIMEOUT otherwise.
  */
 static int sdmmc_wait_card_ready(SD_CardInfo_t *info, uint32_t timeout_ms)
 {
@@ -546,7 +633,9 @@ static int sdmmc_wait_card_ready(SD_CardInfo_t *info, uint32_t timeout_ms)
         {
             uint8_t card_state = (status >> 9) & 0x0FU;
             if (card_state == 4)
+            {
                 return SDMMC_OK;
+            }
             if (card_state == 6 || card_state == 5)
             {
                 SDMMC_SendCmd(SD_CMD12_STOP_TRANSMISSION, 0, SDMMC_RESP_SHORT);
@@ -558,7 +647,9 @@ static int sdmmc_wait_card_ready(SD_CardInfo_t *info, uint32_t timeout_ms)
         }
 
         if ((HAL_GetTick() - start) > timeout_ms)
+        {
             return (ret == SDMMC_OK) ? SDMMC_ERR_BUSY : ret;
+        }
 
         sdmmc_delay_ms(1);
     }
@@ -566,6 +657,10 @@ static int sdmmc_wait_card_ready(SD_CardInfo_t *info, uint32_t timeout_ms)
 
 /**
  * @brief Reads a single 512-byte block from the SD card.
+ * @param info Card information structure of the initialized card.
+ * @param block Block address to read.
+ * @param buf Destination buffer of at least 512 bytes.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t *buf)
 {
@@ -574,9 +669,13 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
     uint32_t sta;
 
     if (info->CardType == SD_CARD_V2_HC)
+    {
         addr = block;
+    }
     else
+    {
         addr = block * 512U;
+    }
 
     ret = sdmmc_wait_card_ready(info, 1000);
     if (ret != SDMMC_OK)
@@ -593,7 +692,9 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
 
     ret = SDMMC_SendCmd(SD_CMD17_READ_SINGLE_BLOCK, addr, SDMMC_RESP_SHORT);
     if (ret != SDMMC_OK)
+    {
         return ret;
+    }
 
     uint32_t count = 0;
     uint32_t *buf32 = (uint32_t *)buf;
@@ -618,14 +719,20 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
             SDMMC1->DCTRL = 0;
 
             if (sta & SDMMC_STA_DTIMEOUT)
+            {
                 return SDMMC_ERR_DATA_TIMEOUT;
+            }
             if (sta & SDMMC_STA_RXOVERR)
+            {
                 return SDMMC_ERR_RX_OVERRUN;
+            }
             return SDMMC_ERR_DATA_CRC;
         }
 
         if (sta & SDMMC_STA_DATAEND)
+        {
             break;
+        }
 
         if ((HAL_GetTick() - start_tick) > 4000U)
         {
@@ -649,11 +756,17 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
         {
             s_last_sta = sta;
             if (sta & SDMMC_STA_DTIMEOUT)
+            {
                 break;
+            }
             if (sta & SDMMC_STA_DCRCFAIL)
+            {
                 break;
+            }
             if (sta & SDMMC_STA_RXOVERR)
+            {
                 break;
+            }
             break;
         }
         if ((HAL_GetTick() - start_tick) > 4000U)
@@ -670,14 +783,22 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
     SDMMC1->DCTRL = 0;
 
     if (sta & SDMMC_STA_DTIMEOUT)
+    {
         return SDMMC_ERR_DATA_TIMEOUT;
+    }
     if (sta & SDMMC_STA_DCRCFAIL)
+    {
         return SDMMC_ERR_DATA_CRC;
+    }
     if (sta & SDMMC_STA_RXOVERR)
+    {
         return SDMMC_ERR_RX_OVERRUN;
+    }
 
     if (count < 128)
+    {
         return SDMMC_ERR_GENERAL;
+    }
 
     sdmmc_delay_ms(2);
     return SDMMC_OK;
@@ -685,6 +806,10 @@ static int sdmmc_read_block_single(SD_CardInfo_t *info, uint32_t block, uint8_t 
 
 /**
  * @brief Reads a single block with retries on failure.
+ * @param info Card information structure of the initialized card.
+ * @param block Block address to read.
+ * @param buf Destination buffer of at least 512 bytes.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_ReadBlock(SD_CardInfo_t *info, uint32_t block, uint8_t *buf)
 {
@@ -693,10 +818,14 @@ int SDMMC_ReadBlock(SD_CardInfo_t *info, uint32_t block, uint8_t *buf)
     {
         ret = sdmmc_read_block_single(info, block, buf);
         if (ret == SDMMC_OK)
+        {
             return SDMMC_OK;
+        }
 
         if (ret == SDMMC_ERR_TIMEOUT || ret == SDMMC_ERR_CMD_TIMEOUT || ret == SDMMC_ERR_DATA_TIMEOUT)
+        {
             sdmmc_increment(&s_diagnostics.timeouts);
+        }
 
         SDMMC1->DCTRL = 0;
         sdmmc_clear_flags();
@@ -709,6 +838,11 @@ int SDMMC_ReadBlock(SD_CardInfo_t *info, uint32_t block, uint8_t *buf)
 
 /**
  * @brief Reads multiple consecutive blocks from the SD card.
+ * @param info Card information structure of the initialized card.
+ * @param block First block address to read.
+ * @param buf Destination buffer of at least count * 512 bytes.
+ * @param count Number of blocks to read.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 
 int SDMMC_ReadBlocks(SD_CardInfo_t *info, uint32_t block, uint8_t *buf, uint32_t count)
@@ -717,13 +851,19 @@ int SDMMC_ReadBlocks(SD_CardInfo_t *info, uint32_t block, uint8_t *buf, uint32_t
     {
         int ret = SDMMC_ReadBlock(info, block + i, buf + (i * 512));
         if (ret != SDMMC_OK)
+        {
             return ret;
+        }
     }
     return SDMMC_OK;
 }
 
 /**
  * @brief Writes a single 512-byte block to the SD card.
+ * @param info Card information structure of the initialized card.
+ * @param block Block address to write.
+ * @param buf Source buffer of at least 512 bytes.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf)
 {
@@ -732,9 +872,13 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
     uint32_t sta;
 
     if (info->CardType == SD_CARD_V2_HC)
+    {
         addr = block;
+    }
     else
+    {
         addr = block * 512U;
+    }
 
     ret = sdmmc_wait_card_ready(info, 1000);
     if (ret != SDMMC_OK)
@@ -772,10 +916,14 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
     {
         sta = SDMMC1->STA;
         if (sta & (SDMMC_STA_TXUNDERR | SDMMC_STA_DCRCFAIL | SDMMC_STA_DTIMEOUT))
+        {
             break;
+        }
 
         if ((HAL_GetTick() - start_tick) > 4000U)
+        {
             break;
+        }
 
         if (sta & (SDMMC_STA_TXFIFOHE | SDMMC_STA_TXFIFOE))
         {
@@ -794,7 +942,9 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
     while (!(SDMMC1->STA & (SDMMC_STA_DATAEND | SDMMC_STA_DBCKEND | SDMMC_STA_DCRCFAIL | SDMMC_STA_DTIMEOUT | SDMMC_STA_TXUNDERR)))
     {
         if ((HAL_GetTick() - start_tick) > 4000)
+        {
             break;
+        }
     }
 
     sta = SDMMC1->STA;
@@ -803,15 +953,25 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
     SDMMC1->DCTRL = 0;
 
     if (sta & SDMMC_STA_DTIMEOUT)
+    {
         return SDMMC_ERR_DATA_TIMEOUT;
+    }
     if (sta & SDMMC_STA_DCRCFAIL)
+    {
         return SDMMC_ERR_DATA_CRC;
+    }
     if (sta & SDMMC_STA_TXUNDERR)
+    {
         return SDMMC_ERR_TX_UNDERRUN;
+    }
     if (count != 128)
+    {
         return SDMMC_ERR_TIMEOUT;
+    }
     if (!(sta & (SDMMC_STA_DBCKEND | SDMMC_STA_DATAEND)))
+    {
         return SDMMC_ERR_TIMEOUT;
+    }
 
     ret = sdmmc_wait_card_ready(info, 5000);
     if (ret != SDMMC_OK)
@@ -826,6 +986,10 @@ static int sdmmc_write_block_single(SD_CardInfo_t *info, uint32_t block, const u
 
 /**
  * @brief Writes a single block with retries on failure.
+ * @param info Card information structure of the initialized card.
+ * @param block Block address to write.
+ * @param buf Source buffer of at least 512 bytes.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_WriteBlock(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf)
 {
@@ -834,17 +998,23 @@ int SDMMC_WriteBlock(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf)
     for (int retry = 0; retry < 3; retry++)
     {
         if (retry != 0)
+        {
             sdmmc_increment(&s_diagnostics.write_retries);
+        }
         ret = sdmmc_write_block_single(info, block, buf);
         if (ret == SDMMC_OK)
         {
             if (retry != 0)
+            {
                 sdmmc_increment(&s_diagnostics.write_recovered);
+            }
             break;
         }
 
         if (ret == SDMMC_ERR_TIMEOUT || ret == SDMMC_ERR_CMD_TIMEOUT || ret == SDMMC_ERR_DATA_TIMEOUT)
+        {
             sdmmc_increment(&s_diagnostics.timeouts);
+        }
 
         SDMMC1->DCTRL = 0;
         sdmmc_clear_flags();
@@ -852,18 +1022,27 @@ int SDMMC_WriteBlock(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf)
         sdmmc_wait_card_ready(info, 500);
     }
     if (ret != SDMMC_OK)
+    {
         sdmmc_increment(&s_diagnostics.write_failures);
+    }
     uint32_t elapsed = HAL_GetTick() - start;
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     if (elapsed > s_diagnostics.max_write_ms)
+    {
         s_diagnostics.max_write_ms = elapsed;
+    }
     __set_PRIMASK(primask);
     return ret;
 }
 
 /**
  * @brief Writes multiple consecutive blocks to the SD card.
+ * @param info Card information structure of the initialized card.
+ * @param block First block address to write.
+ * @param buf Source buffer of at least count * 512 bytes.
+ * @param count Number of blocks to write.
+ * @return SDMMC_OK on success, or the driver error code.
  */
 int SDMMC_WriteBlocks(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf, uint32_t count)
 {
@@ -871,7 +1050,9 @@ int SDMMC_WriteBlocks(SD_CardInfo_t *info, uint32_t block, const uint8_t *buf, u
     {
         int ret = SDMMC_WriteBlock(info, block + i, buf + (i * 512));
         if (ret != SDMMC_OK)
+        {
             return ret;
+        }
     }
     return SDMMC_OK;
 }

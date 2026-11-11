@@ -18,52 +18,102 @@
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
 /* MMC card type flags */
-#define CT_MMC   0x01
-#define CT_SD1   0x02
-#define CT_SD2   0x04
-#define CT_SDC   (CT_SD1 | CT_SD2)
+#define CT_MMC 0x01
+#define CT_SD1 0x02
+#define CT_SD2 0x04
+#define CT_SDC (CT_SD1 | CT_SD2)
 #define CT_BLOCK 0x08
 
 /* Private variables ---------------------------------------------------------*/
 static volatile DSTATUS Stat = STA_NOINIT;
 static SD_CardInfo_t s_sd_card_info;
 
+#define SD_DISK_INIT_BACKOFF_MS 500U
+static uint32_t s_init_backoff_until = 0;
+static uint32_t s_init_attempts = 0;
+static uint32_t s_init_failures = 0;
+
 /* Prototype of diskio functions */
-DSTATUS USER_initialize (BYTE pdrv);
-DSTATUS USER_status (BYTE pdrv);
-DRESULT USER_read (BYTE pdrv, BYTE *buff, DWORD sector, UINT count);
+DSTATUS USER_initialize(BYTE pdrv);
+DSTATUS USER_status(BYTE pdrv);
+DRESULT USER_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count);
 #if _USE_WRITE == 1
-DRESULT USER_write (BYTE pdrv, const BYTE *buff, DWORD sector, UINT count);
+DRESULT USER_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count);
 #endif /* _USE_WRITE == 1 */
 #if _USE_IOCTL == 1
-DRESULT USER_ioctl (BYTE pdrv, BYTE cmd, void *buff);
+DRESULT USER_ioctl(BYTE pdrv, BYTE cmd, void *buff);
 #endif /* _USE_IOCTL == 1 */
 
 Diskio_drvTypeDef USER_Driver =
-{
-  USER_initialize,
-  USER_status,
-  USER_read,
+    {
+        USER_initialize,
+        USER_status,
+        USER_read,
 #if _USE_WRITE == 1
-  USER_write,
+        USER_write,
 #endif /* _USE_WRITE == 1 */
 #if _USE_IOCTL == 1
-  USER_ioctl,
+        USER_ioctl,
 #endif /* _USE_IOCTL == 1 */
 };
 
 /* Private functions ---------------------------------------------------------*/
 
+/*
+ * Marks the drive as needing a full re-initialisation.
+ *
+ * Every bus failure means the card can no longer be trusted, so the next access
+ * re-runs the card initialisation sequence instead of retrying against stale
+ * card state. This is also what makes card reinsertion recoverable: an error
+ * clears the initialised flag and USER_initialize() rebuilds it.
+ */
+static void USER_mark_not_ready(void)
+{
+  Stat |= STA_NOINIT;
+  s_sd_card_info.RCA = 0;
+}
+
 /**
-  * @brief  Initializes a Drive over SDMMC1 in 4-bit mode
-  * @param  pdrv: Physical drive number (0..)
-  * @retval DSTATUS: Operation status
-  */
+ * @brief  Reports whether the SD drive is currently usable.
+ * @retval true when the card is initialised and no transfer has failed since
+ *         (read by the storage-owner task to drive media recovery).
+ */
+bool USER_Diskio_IsReady(void)
+{
+  return ((Stat & STA_NOINIT) == 0U);
+}
+
+/**
+ * @brief  Reports the drive statistics gathered by this layer.
+ */
+void USER_Diskio_GetStats(USER_DiskioStats_t *out)
+{
+  if (out == NULL)
+  {
+    return;
+  }
+  out->init_attempts = s_init_attempts;
+  out->init_failures = s_init_failures;
+  out->not_ready = (uint32_t)((Stat & STA_NOINIT) ? 1U : 0U);
+}
+
+/**
+ * @brief  Initializes a Drive over SDMMC1 in 4-bit mode
+ * @param  pdrv: Physical drive number (0..)
+ * @retval DSTATUS: Operation status
+ */
 DSTATUS USER_initialize(BYTE pdrv)
 {
+  uint32_t now = HAL_GetTick();
+
   if (pdrv != 0)
   {
     return STA_NOINIT;
+  }
+
+  if ((Stat & STA_NOINIT) && ((int32_t)(now - s_init_backoff_until) < 0))
+  {
+    return Stat;
   }
 
   /* If card is already initialized and responsive, keep it */
@@ -81,10 +131,13 @@ DSTATUS USER_initialize(BYTE pdrv)
   SDMMC_PeripheralInit();
 
   /* Perform full card initialization sequence */
+  s_init_attempts++;
   int ret = SDMMC_CardInit(&s_sd_card_info);
   if (ret != SDMMC_OK)
   {
-    Stat = STA_NOINIT;
+    s_init_failures++;
+    s_init_backoff_until = HAL_GetTick() + SD_DISK_INIT_BACKOFF_MS;
+    USER_mark_not_ready();
     return Stat;
   }
 
@@ -103,10 +156,10 @@ DSTATUS USER_initialize(BYTE pdrv)
 }
 
 /**
-  * @brief  Gets Disk Status
-  * @param  pdrv: Physical drive number (0..)
-  * @retval DSTATUS: Operation status
-  */
+ * @brief  Gets Disk Status
+ * @param  pdrv: Physical drive number (0..)
+ * @retval DSTATUS: Operation status
+ */
 DSTATUS USER_status(BYTE pdrv)
 {
   if (pdrv != 0)
@@ -118,13 +171,13 @@ DSTATUS USER_status(BYTE pdrv)
 }
 
 /**
-  * @brief  Reads Sector(s) from SD card over SDMMC1
-  * @param  pdrv: Physical drive number (0..)
-  * @param  *buff: Data buffer to store read data
-  * @param  sector: Sector address (LBA)
-  * @param  count: Number of sectors to read
-  * @retval DRESULT: Operation result
-  */
+ * @brief  Reads Sector(s) from SD card over SDMMC1
+ * @param  pdrv: Physical drive number (0..)
+ * @param  *buff: Data buffer to store read data
+ * @param  sector: Sector address (LBA)
+ * @param  count: Number of sectors to read
+ * @retval DRESULT: Operation result
+ */
 DRESULT USER_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 {
   if (pdrv != 0 || buff == NULL || count == 0)
@@ -150,6 +203,7 @@ DRESULT USER_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
       int ret = SDMMC_ReadBlock(&s_sd_card_info, (uint32_t)(sector + i), dst);
       if (ret != SDMMC_OK)
       {
+        USER_mark_not_ready();
         return RES_ERROR;
       }
     }
@@ -159,6 +213,7 @@ DRESULT USER_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
       int ret = SDMMC_ReadBlock(&s_sd_card_info, (uint32_t)(sector + i), (uint8_t *)temp_buf);
       if (ret != SDMMC_OK)
       {
+        USER_mark_not_ready();
         return RES_ERROR;
       }
       memcpy(dst, temp_buf, 512);
@@ -169,13 +224,13 @@ DRESULT USER_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count)
 }
 
 /**
-  * @brief  Writes Sector(s) to SD card over SDMMC1
-  * @param  pdrv: Physical drive number (0..)
-  * @param  *buff: Data to be written
-  * @param  sector: Sector address (LBA)
-  * @param  count: Number of sectors to write
-  * @retval DRESULT: Operation result
-  */
+ * @brief  Writes Sector(s) to SD card over SDMMC1
+ * @param  pdrv: Physical drive number (0..)
+ * @param  *buff: Data to be written
+ * @param  sector: Sector address (LBA)
+ * @param  count: Number of sectors to write
+ * @retval DRESULT: Operation result
+ */
 #if _USE_WRITE == 1
 DRESULT USER_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 {
@@ -202,6 +257,7 @@ DRESULT USER_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
       int ret = SDMMC_WriteBlock(&s_sd_card_info, (uint32_t)(sector + i), src);
       if (ret != SDMMC_OK)
       {
+        USER_mark_not_ready();
         return RES_ERROR;
       }
     }
@@ -212,6 +268,7 @@ DRESULT USER_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
       int ret = SDMMC_WriteBlock(&s_sd_card_info, (uint32_t)(sector + i), (const uint8_t *)temp_buf);
       if (ret != SDMMC_OK)
       {
+        USER_mark_not_ready();
         return RES_ERROR;
       }
     }
@@ -222,12 +279,12 @@ DRESULT USER_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count)
 #endif /* _USE_WRITE == 1 */
 
 /**
-  * @brief  I/O control operation
-  * @param  pdrv: Physical drive number (0..)
-  * @param  cmd: Control code
-  * @param  *buff: Buffer to send/receive control data
-  * @retval DRESULT: Operation result
-  */
+ * @brief  I/O control operation
+ * @param  pdrv: Physical drive number (0..)
+ * @param  cmd: Control code
+ * @param  *buff: Buffer to send/receive control data
+ * @retval DRESULT: Operation result
+ */
 #if _USE_IOCTL == 1
 DRESULT USER_ioctl(BYTE pdrv, BYTE cmd, void *buff)
 {
