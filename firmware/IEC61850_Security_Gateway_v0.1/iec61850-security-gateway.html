@@ -324,9 +324,17 @@
         gap: 10px;
       }
 
-      .accounting-metrics .stat-tile { min-width: 0; }
-      .accounting-metrics .stat-value { font-size: 14px; overflow-wrap: anywhere; }
-      .accounting-status { color: var(--slate-soft); font-size: 10.5px; }
+      .accounting-metrics .stat-tile {
+        min-width: 0;
+      }
+      .accounting-metrics .stat-value {
+        font-size: 14px;
+        overflow-wrap: anywhere;
+      }
+      .accounting-status {
+        color: var(--slate-soft);
+        font-size: 10.5px;
+      }
 
       .page-nav-actions {
         display: flex;
@@ -380,7 +388,6 @@
         margin-top: 16px;
       }
 
-      /* Diagnostics panels reuse the configuration page card/table shell. */
       .diag-panel {
         display: none;
       }
@@ -413,9 +420,17 @@
       }
 
       @media (max-width: 580px) {
-        .accounting-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-        .accounting-table thead { display: none; }
-        .accounting-table, .accounting-table tbody, .accounting-table tr { display: block; }
+        .accounting-metrics {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .accounting-table thead {
+          display: none;
+        }
+        .accounting-table,
+        .accounting-table tbody,
+        .accounting-table tr {
+          display: block;
+        }
         .accounting-table tbody tr {
           display: grid;
           grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -430,7 +445,10 @@
           padding: 2px 0;
           border: 0;
         }
-        .accounting-table tbody td:first-child { grid-column: 1 / -1; font-weight: 600; }
+        .accounting-table tbody td:first-child {
+          grid-column: 1 / -1;
+          font-weight: 600;
+        }
         .accounting-table tbody td:not(:first-child)::before {
           content: attr(data-label);
           color: var(--slate-soft);
@@ -2475,7 +2493,9 @@
                 stroke-linecap="round"
                 stroke-linejoin="round"
               >
-                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <path
+                  d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
+                ></path>
                 <line x1="12" y1="9" x2="12" y2="13"></line>
                 <line x1="12" y1="17" x2="12.01" y2="17"></line>
               </svg>
@@ -2593,7 +2613,9 @@
               </tr>
             </thead>
             <tbody id="packet-accounting">
-              <tr><td colspan="5">Unavailable</td></tr>
+              <tr>
+                <td colspan="5">Unavailable</td>
+              </tr>
             </tbody>
           </table>
 
@@ -2658,7 +2680,9 @@
               </tr>
             </thead>
             <tbody id="task-health-body">
-              <tr><td colspan="7">Unavailable</td></tr>
+              <tr>
+                <td colspan="7">Unavailable</td>
+              </tr>
             </tbody>
           </table>
 
@@ -2676,7 +2700,9 @@
               </tr>
             </thead>
             <tbody id="diag-system-body">
-              <tr><td colspan="2">Unavailable</td></tr>
+              <tr>
+                <td colspan="2">Unavailable</td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -2814,7 +2840,9 @@
                 stroke-linecap="round"
                 stroke-linejoin="round"
               >
-                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <path
+                  d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
+                ></path>
                 <line x1="12" y1="9" x2="12" y2="13"></line>
                 <line x1="12" y1="17" x2="12.01" y2="17"></line>
               </svg>
@@ -3323,7 +3351,7 @@
                 </td>
               </tr>
 
-              <tr data-category="ALERTS" style="display:none">
+              <tr data-category="ALERTS" style="display: none">
                 <td><span class="proto-badge badge-alerts">ALERTS</span></td>
                 <td><strong>Burst Aggregation Window</strong></td>
                 <td>
@@ -3348,7 +3376,7 @@
                   </div>
                 </td>
               </tr>
-              <tr data-category="ALERTS" style="display:none">
+              <tr data-category="ALERTS" style="display: none">
                 <td><span class="proto-badge badge-alerts">ALERTS</span></td>
                 <td><strong>Max Aggregation Period</strong></td>
                 <td>
@@ -3398,7 +3426,7 @@
                   </div>
                 </td>
               </tr>
-              <tr data-category="ALERTS" style="display:none">
+              <tr data-category="ALERTS" style="display: none">
                 <td><span class="proto-badge badge-alerts">ALERTS</span></td>
                 <td><strong>Normal Traffic Heartbeat Throttle</strong></td>
                 <td>
@@ -3621,27 +3649,11 @@
         const wrapper = document.getElementById("export-dropdown-wrapper");
         if (!menu) return;
 
-        const allCount = detectedAlerts ? detectedAlerts.length : 0;
-        const critCount = detectedAlerts
-          ? detectedAlerts.filter(
-              (a) => (a.severity || "").toUpperCase() === "CRITICAL",
-            ).length
-          : 0;
-        const highCount = detectedAlerts
-          ? detectedAlerts.filter(
-              (a) => (a.severity || "").toUpperCase() === "HIGH",
-            ).length
-          : 0;
-        const warnCount = detectedAlerts
-          ? detectedAlerts.filter(
-              (a) => (a.severity || "").toUpperCase() === "WARNING",
-            ).length
-          : 0;
-        const infoCount = detectedAlerts
-          ? detectedAlerts.filter(
-              (a) => (a.severity || "").toUpperCase() === "INFO",
-            ).length
-          : 0;
+        const allCount = alertSummary.total;
+        const critCount = alertSummary.critical;
+        const highCount = alertSummary.high;
+        const warnCount = alertSummary.warning;
+        const infoCount = alertSummary.info;
 
         const cAll = document.getElementById("export-count-all");
         if (cAll) cAll.innerText = allCount;
@@ -4547,56 +4559,101 @@
         exportAlertsBySeverity("ALL");
       }
 
-      function exportAlertsBySeverity(severity = "ALL") {
+      function alertCsvRow(a) {
+        const tf = formatAlertTimestamp(a);
+        const row = [
+          a.id,
+          a.ts,
+          a.frameTs,
+          `"${tf.time}"`,
+          `"${tf.date}"`,
+          a.protocol,
+          a.type,
+          a.severity,
+          a.srcMac,
+          a.target || "",
+          a.appId || "",
+          '"' + (a.details || "").replace(/"/g, '""') + '"',
+        ];
+        return row.join(",") + "\n";
+      }
+
+      function createAlertCsvStream(severity, counters) {
+        const header =
+          "ID,STM32_Rx_ts_ms,Network_frameTs_ms,Event_Time,Event_Date,Protocol,Type,Severity,Source_MAC_IP,Target_Channel,AppID,Details\n";
+        const sevQuery =
+          severity === "ALL" ? "" : `&severity=${encodeURIComponent(severity)}`;
+
+        return new ReadableStream({
+          async start(controller) {
+            const enc = new TextEncoder();
+            controller.enqueue(enc.encode(header));
+            try {
+              let cursor = null;
+              let hasMore = true;
+              while (hasMore) {
+                let url = `${getApiEndpoint("/api/alerts")}?limit=${ALERT_PAGE_SIZE}${sevQuery}`;
+                if (cursor !== null && cursor !== undefined) {
+                  url += `&cursor=${encodeURIComponent(cursor)}`;
+                }
+                const response = await fetch(url, { cache: "no-store" });
+                if (!response.ok) throw new Error("HTTP " + response.status);
+                const page = await response.json();
+                const items = Array.isArray(page.alerts) ? page.alerts : [];
+
+                for (const item of items) {
+                  const alert = normalizeAlert(item);
+                  if (!alert) continue;
+                  controller.enqueue(enc.encode(alertCsvRow(alert)));
+                  counters.rows++;
+                }
+
+                const next =
+                  page.next_cursor === null || page.next_cursor === undefined
+                    ? null
+                    : page.next_cursor;
+                hasMore =
+                  Boolean(page.has_more) &&
+                  next !== null &&
+                  (cursor === null || next < cursor);
+                cursor = next;
+              }
+              controller.close();
+            } catch (err) {
+              controller.error(err);
+            }
+          },
+        });
+      }
+
+      async function exportAlertsBySeverity(severity = "ALL") {
         closeExportMenu();
 
-        if (!detectedAlerts || !detectedAlerts.length) {
-          showToast("No alerts to export.", "warning");
+        const downloadName =
+          severity === "ALL"
+            ? "iec61850_alerts.csv"
+            : `iec61850_alerts_${severity.toLowerCase()}.csv`;
+        const counters = { rows: 0 };
+
+        let blob;
+        try {
+          const stream = createAlertCsvStream(severity, counters);
+          blob = await new Response(stream, {
+            headers: { "Content-Type": "text/csv;charset=utf-8;" },
+          }).blob();
+        } catch (err) {
+          showToast(`Export failed: ${err.message}`, "error");
           return;
         }
 
-        const toExport =
-          severity === "ALL"
-            ? detectedAlerts
-            : detectedAlerts.filter(
-                (a) => (a.severity || "").toUpperCase() === severity,
-              );
-
-        if (!toExport.length) {
+        if (counters.rows === 0) {
           const sevLabel = severity === "ALL" ? "" : severity + " ";
           showToast(`No ${sevLabel}alerts found to export.`, "warning");
           return;
         }
 
-        let csv =
-          "ID,STM32_Rx_ts_ms,Network_frameTs_ms,Event_Time,Event_Date,Protocol,Type,Severity,Source_MAC_IP,Target_Channel,AppID,Details\n";
-        toExport.forEach((a) => {
-          const tf = formatAlertTimestamp(a);
-          const row = [
-            a.id,
-            a.ts,
-            a.frameTs,
-            `"${tf.time}"`,
-            `"${tf.date}"`,
-            a.protocol,
-            a.type,
-            a.severity,
-            a.srcMac,
-            a.target || "",
-            a.appId || "",
-            '"' + (a.details || "").replace(/"/g, '""') + '"',
-          ];
-          csv += row.join(",") + "\n";
-        });
-
-        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
-        const downloadName =
-          severity === "ALL"
-            ? "iec61850_alerts.csv"
-            : `iec61850_alerts_${severity.toLowerCase()}.csv`;
-
         link.setAttribute("href", url);
         link.setAttribute("download", downloadName);
         document.body.appendChild(link);
@@ -4606,7 +4663,7 @@
 
         const sevDesc = severity === "ALL" ? "all" : severity;
         showToast(
-          `Exported ${toExport.length} ${sevDesc} alerts to CSV (${downloadName}).`,
+          `Exported ${counters.rows} ${sevDesc} alerts to CSV (${downloadName}).`,
           "success",
         );
       }
@@ -4899,7 +4956,10 @@
 
           setText("packet-ram", data.alerts_created);
           setText("packet-synced", data.alerts_persisted);
-          setText("packet-queue", `${data.queue_used} / ${data.queue_capacity}`);
+          setText(
+            "packet-queue",
+            `${data.queue_used} / ${data.queue_capacity}`,
+          );
           setText("packet-failures", data.alert_queue_failures);
           setText("packet-errors", data.storage_errors);
           setText("packet-last", `${data.last_parsed_ms} ms`);
@@ -4910,7 +4970,8 @@
 
           setSystemDiagnostics(data);
         } catch (error) {
-          health.textContent = "Processing health unavailable; values may be stale";
+          health.textContent =
+            "Processing health unavailable; values may be stale";
         }
       }
 
@@ -5028,9 +5089,23 @@
         refreshAlertSummary();
       });
 
-      /* ---------------------------------------------------------------
-       * Alert summary (cheap count, no records) and incremental loading.
-       * ------------------------------------------------------------- */
+      let alertSummaryRefreshTimer = null;
+      let alertSummaryRefreshPending = false;
+
+      function scheduleAlertSummaryRefresh() {
+        if (alertSummaryRefreshTimer !== null) {
+          alertSummaryRefreshPending = true;
+          return;
+        }
+        alertSummaryRefreshTimer = setTimeout(async () => {
+          alertSummaryRefreshTimer = null;
+          await refreshAlertSummary();
+          if (alertSummaryRefreshPending) {
+            alertSummaryRefreshPending = false;
+            scheduleAlertSummaryRefresh();
+          }
+        }, 1000);
+      }
 
       async function refreshAlertSummary() {
         try {
@@ -5145,9 +5220,9 @@
           } catch (err) {
             if (err && err.name === "AbortError") throw err;
             lastError = err;
-            /* The gateway serves alert pages from a small fixed buffer pool;
-             * a superseded request can hold one for a moment, so retry. */
-            await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+            await new Promise((resolve) =>
+              setTimeout(resolve, 350 * (attempt + 1)),
+            );
           }
         }
         throw lastError;
@@ -5209,9 +5284,6 @@
             renderAlertsTable();
           }
 
-          /* The backend scans ahead, so an empty page normally means the
-           * history is exhausted. If it still reports more, continue from the
-           * returned cursor so the user is never stranded on an empty list. */
           if (
             appended === 0 &&
             parsed.length === 0 &&
@@ -5273,7 +5345,10 @@
             if (alertsLoadFailed) {
               showToast("Could not retrieve alerts from Gateway.", "error");
             } else {
-              showToast("Alerts successfully refreshed from Gateway.", "success");
+              showToast(
+                "Alerts successfully refreshed from Gateway.",
+                "success",
+              );
             }
           }
         } finally {
@@ -5299,7 +5374,9 @@
         container.addEventListener("scroll", () => {
           if (alertsLoading || !alertsHasMore || alertsLoadFailed) return;
           const remaining =
-            container.scrollHeight - container.scrollTop - container.clientHeight;
+            container.scrollHeight -
+            container.scrollTop -
+            container.clientHeight;
           if (remaining < 120) {
             loadAlertsPage(false);
           }
@@ -5374,9 +5451,8 @@
                 (a) => a.id === newAlert.id,
               );
               if (existingIdx === -1) {
-                totalAlertsCount++;
-                alertSummary.total = totalAlertsCount;
                 detectedAlerts.unshift(newAlert);
+                scheduleAlertSummaryRefresh();
                 renderAlertsTable();
                 updateMainViewStats();
               }

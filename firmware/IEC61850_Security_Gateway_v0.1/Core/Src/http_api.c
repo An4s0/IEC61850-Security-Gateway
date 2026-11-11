@@ -9,6 +9,7 @@
 #include "sdmmc.h"
 #include "storage_service.h"
 #include "runtime_stats.h"
+#include "health_monitor.h"
 #include "sys_diag.h"
 #include "fatfs.h"
 #include "ff.h"
@@ -27,6 +28,13 @@
 #define MAX_ALERT_POOL 4
 
 #define BODY_CHUNK_SIZE 512
+
+#define HTTP_JSON_BODY_MAX 4096
+#define HTTP_JSON_RESP_MAX (HTTP_JSON_BODY_MAX + 256)
+#define HTTP_JSON_SMALL_BODY_MAX 512
+#define HTTP_JSON_SMALL_RESP_MAX (HTTP_JSON_SMALL_BODY_MAX + 256)
+
+static void send_json_overflow(struct tcp_pcb *pcb);
 
 static struct tcp_pcb *api_pcb = NULL;
 
@@ -62,6 +70,10 @@ static uint8_t sse_client_count = 0;
 static char s_alert_resp_buffers[NUM_ALERT_RESP_BUFS][ALERT_RESP_BUF_SIZE];
 static uint8_t s_alert_buf_busy[NUM_ALERT_RESP_BUFS] = {0, 0};
 
+/**
+ * @brief Reserves one shared alert response buffer.
+ * @return Buffer index, or -1 when every buffer is currently in use.
+ */
 static int acquire_alert_resp_buffer(void)
 {
     for (int i = 0; i < NUM_ALERT_RESP_BUFS; i++)
@@ -75,6 +87,10 @@ static int acquire_alert_resp_buffer(void)
     return -1;
 }
 
+/**
+ * @brief Returns a shared alert response buffer to the pool.
+ * @param idx Buffer index previously returned by acquire_alert_resp_buffer().
+ */
 static void release_alert_resp_buffer(int idx)
 {
     if (idx >= 0 && idx < NUM_ALERT_RESP_BUFS)
@@ -110,6 +126,8 @@ static void do_storage_complete(void *ctx);
 
 /**
  * @brief Allocates a client state slot from the static pool.
+ * @param pcb Connection the client record belongs to.
+ * @return Allocated client record, or NULL when the table is full.
  */
 static HTTP_API_Client_t *alloc_client(struct tcp_pcb *pcb)
 {
@@ -138,6 +156,7 @@ static HTTP_API_Client_t *alloc_client(struct tcp_pcb *pcb)
  * released here: the request keeps ownership and the completion callback
  * releases it. This prevents a recycled buffer being written by the storage
  * task while another client is using it.
+ * @param client Client record to release; ignored when NULL.
  */
 static void free_client(HTTP_API_Client_t *client)
 {
@@ -157,6 +176,7 @@ static void free_client(HTTP_API_Client_t *client)
 
 /**
  * @brief Removes an SSE client from the active broadcast list.
+ * @param client SSE client to unlink from the broadcast list.
  */
 static void remove_sse_client(HTTP_API_Client_t *client)
 {
@@ -183,6 +203,10 @@ static void remove_sse_client(HTTP_API_Client_t *client)
 
 /**
  * @brief Callback invoked when data has been successfully transmitted.
+ * @param arg Callback argument (unused).
+ * @param pcb Connection that acknowledged the data.
+ * @param len Number of bytes acknowledged.
+ * @return ERR_OK.
  */
 static err_t api_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
@@ -201,6 +225,9 @@ static err_t api_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 
 /**
  * @brief Periodic poll callback to detect stale connections and keep SSE alive.
+ * @param arg Callback argument (unused).
+ * @param pcb Connection to service.
+ * @return ERR_OK, or ERR_ABRT after the connection was closed.
  */
 static err_t api_poll(void *arg, struct tcp_pcb *pcb)
 {
@@ -223,7 +250,6 @@ static err_t api_poll(void *arg, struct tcp_pcb *pcb)
         }
         else if (now - client->last_activity >= 15000U)
         {
-            /* A stalled stream must not pin the shared response buffer. */
             SysLog_Print(SYSLOG_LEVEL_DEBUG, "HTTP", "Alert stream stalled, aborting");
             api_abort_conn(pcb, client);
             return ERR_ABRT;
@@ -268,6 +294,9 @@ static err_t api_poll(void *arg, struct tcp_pcb *pcb)
 
 /**
  * @brief Locates the boundary between HTTP headers and body.
+ * @param data Received bytes.
+ * @param len Number of bytes available.
+ * @return Offset just past the terminating CRLFCRLF, or -1 when the headers are incomplete.
  */
 static int find_header_end(const char *data, uint16_t len)
 {
@@ -292,6 +321,8 @@ static int find_header_end(const char *data, uint16_t len)
 
 /**
  * @brief Parses the Content-Length header value from an HTTP request header.
+ * @param headers NUL-terminated request headers.
+ * @return Declared Content-Length, or 0 when the header is absent or invalid.
  */
 static uint32_t parse_content_length(const char *headers)
 {
@@ -316,6 +347,8 @@ static uint32_t parse_content_length(const char *headers)
 
 /**
  * @brief Sends an HTTP response string over a TCP connection.
+ * @param pcb Connection to write to.
+ * @param response Complete HTTP response text, including the status line and headers.
  */
 static void send_response(struct tcp_pcb *pcb, const char *response)
 {
@@ -328,6 +361,7 @@ static char s_scd_response[512];
 
 /**
  * @brief Handles GET /api/scd requests and returns active configuration metadata in JSON.
+ * @param pcb Connection to answer.
  */
 static void handle_get_scd(struct tcp_pcb *pcb)
 {
@@ -404,6 +438,7 @@ static char s_config_response[1280];
 
 /**
  * @brief Handles GET /api/config requests and returns runtime system/IDS settings in JSON.
+ * @param pcb Connection to answer.
  */
 static void handle_get_config(struct tcp_pcb *pcb)
 {
@@ -435,6 +470,8 @@ static void handle_get_config(struct tcp_pcb *pcb)
 /**
  * @brief Queues a configuration persistence request for the storage owner.
  *        The HTTP response is produced by do_storage_complete().
+ * @param pcb Connection to answer.
+ * @param client Client state owning the request.
  */
 static void submit_config_save(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -466,6 +503,8 @@ static void submit_config_save(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 
 /**
  * @brief Handles POST /api/config/reset requests and resets settings to factory defaults.
+ * @param pcb Connection to answer.
+ * @param client Client state owning the request.
  */
 static void handle_reset_config(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -475,6 +514,10 @@ static void handle_reset_config(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 
 /**
  * @brief Handles POST /api/config requests, validates payload, applies settings, and saves to SD.
+ * @param pcb Connection to answer.
+ * @param body Request body.
+ * @param body_len Length of the request body.
+ * @param client Client state owning the request.
  */
 static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t body_len, HTTP_API_Client_t *client)
 {
@@ -516,6 +559,8 @@ static void handle_post_config(struct tcp_pcb *pcb, const char *body, uint16_t b
 
 /**
  * @brief Streams the alerts response to the HTTP client in TCP-sized chunks.
+ * @param pcb Connection to stream to.
+ * @param client Client state holding the stream cursor.
  */
 static void stream_alerts_response(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -567,6 +612,7 @@ static void stream_alerts_response(struct tcp_pcb *pcb, HTTP_API_Client_t *clien
 
 /**
  * @brief Handles GET /api/accounting requests.
+ * @param pcb Connection to answer.
  */
 static void handle_get_accounting(struct tcp_pcb *pcb)
 {
@@ -575,13 +621,17 @@ static void handle_get_accounting(struct tcp_pcb *pcb)
     Ethernet_Diagnostics_t ethernet;
     SDMMC_Diagnostics_t sd;
     StorageService_Stats_t storage;
+    StorageService_MediaStats_t media;
+    SysLog_Stats_t logstats;
     SysDiag_Stats_t diag;
-    static char body[3072], response[3328];
+    static char body[HTTP_JSON_BODY_MAX], response[HTTP_JSON_RESP_MAX];
     Accounting_Get(&a);
     Security_GetStats(&health);
     Ethernet_GetDiagnostics(&ethernet);
     SDMMC_GetDiagnostics(&sd);
     StorageService_GetStats(&storage);
+    StorageService_GetMediaStats(&media);
+    SysLog_GetStats(&logstats);
     SysDiag_Get(&diag);
     int n = snprintf(body, sizeof(body), "{\"protocols\":[");
     for (int i = 0; i < ACCOUNT_PROTOCOLS && n > 0 && n < (int)sizeof(body); i++)
@@ -594,20 +644,23 @@ static void handle_get_accounting(struct tcp_pcb *pcb)
                       (unsigned long)a.values[i][ACCOUNT_DROP_QUEUE]);
     }
     if (n <= 0 || n >= (int)sizeof(body))
+    {
+        send_json_overflow(pcb);
         return;
+    }
     n += snprintf(body + n, sizeof(body) - (size_t)n,
-                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":%lu,\"alerts_attempted\":%lu,\"persistence_retries\":%lu,\"alerts_dropped_buffer_full\":%lu,\"alerts_dropped_mutex_busy\":%lu,\"alerts_purged\":%lu,\"driver_delivered\":%lu,\"rx_alloc_failures\":%lu,\"dma_error_callbacks\":%lu,\"rx_buffer_unavailable_events\":%lu,\"lwip_input_failures\":%lu,\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,\"task_count\":%lu,\"sd_read_failures\":%lu,\"sd_write_failures\":%lu,\"sd_write_retries\":%lu,\"sd_write_recovered\":%lu,\"sd_timeouts\":%lu,\"sd_max_write_ms\":%lu,\"sd_card_ready_timeouts\":%lu,\"sd_max_irq_off_us\":%lu,\"storage_submitted\":%lu,\"storage_ok\":%lu,\"storage_fail\":%lu,\"storage_queue_full\":%lu,\"storage_lock_timeouts\":%lu,\"storage_cb_failures\":%lu,\"sse_delivered\":%lu,\"sse_pool_exhausted\":%lu,\"sse_post_failed\":%lu,\"uptime_ms\":%lu,\"boot_count\":%lu,\"reset_flags\":%lu}",
+                  "],\"saturated\":%lu,\"last_parsed_ms\":%lu,\"alerts_created\":%lu,\"alerts_persisted\":%lu,\"alert_queue_failures\":%lu,\"storage_errors\":%lu,\"queue_used\":%lu,\"queue_high_water\":%lu,\"queue_capacity\":%lu,\"alerts_attempted\":%lu,\"persistence_retries\":%lu,\"alerts_dropped_buffer_full\":%lu,\"alerts_dropped_mutex_busy\":%lu,\"alerts_purged\":%lu,\"alert_tail_repairs\":%lu,\"driver_delivered\":%lu,\"rx_alloc_failures\":%lu,\"dma_error_callbacks\":%lu,\"rx_buffer_unavailable_events\":%lu,\"lwip_input_failures\":%lu,\"dma_region_violations\":%lu,\"free_heap_bytes\":%lu,\"min_free_heap_bytes\":%lu,\"task_count\":%lu,\"sd_read_failures\":%lu,\"sd_write_failures\":%lu,\"sd_write_retries\":%lu,\"sd_write_recovered\":%lu,\"sd_timeouts\":%lu,\"sd_max_write_ms\":%lu,\"sd_card_ready_timeouts\":%lu,\"sd_max_irq_off_us\":%lu,\"storage_submitted\":%lu,\"storage_ok\":%lu,\"storage_fail\":%lu,\"storage_queue_full\":%lu,\"storage_lock_timeouts\":%lu,\"storage_cb_failures\":%lu,\"sd_card_present\":%lu,\"sd_drive_ready\":%lu,\"sd_mounted\":%lu,\"sd_media_removals\":%lu,\"sd_media_insertions\":%lu,\"sd_drive_faults\":%lu,\"sd_drive_recoveries\":%lu,\"sd_remount_attempts\":%lu,\"sd_remount_ok\":%lu,\"sd_remount_fail\":%lu,\"sd_remount_verify_fail\":%lu,\"sd_disk_init_attempts\":%lu,\"sd_disk_init_failures\":%lu,\"sse_delivered\":%lu,\"sse_pool_exhausted\":%lu,\"sse_post_failed\":%lu,\"uptime_ms\":%lu,\"boot_count\":%lu,\"reset_flags\":%lu",
                   (unsigned long)a.saturated, (unsigned long)a.last_parsed_ms, (unsigned long)health.alerts_generated,
                   (unsigned long)health.alerts_written, (unsigned long)health.alerts_dropped, (unsigned long)health.storage_errors,
                   (unsigned long)health.slots_in_use, (unsigned long)health.slots_high_water,
                   (unsigned long)Security_GetPipelineCapacity(),
                   (unsigned long)health.alerts_attempted, (unsigned long)health.persistence_retries,
                   (unsigned long)health.alerts_dropped_buffer_full, (unsigned long)health.alerts_dropped_mutex_busy,
-                  (unsigned long)health.alerts_purged,
+                  (unsigned long)health.alerts_purged, (unsigned long)health.alert_tail_repairs,
                   (unsigned long)ethernet.delivered, (unsigned long)ethernet.rx_alloc_failures,
                   (unsigned long)ethernet.dma_error_callbacks, (unsigned long)ethernet.rx_buffer_unavailable,
-                  (unsigned long)ethernet.lwip_input_failures, (unsigned long)xPortGetFreeHeapSize(),
-                  (unsigned long)xPortGetMinimumEverFreeHeapSize(), (unsigned long)uxTaskGetNumberOfTasks(),
+                  (unsigned long)ethernet.lwip_input_failures,
+                  (unsigned long)ethernet.dma_region_violations, (unsigned long)xPortGetFreeHeapSize(), (unsigned long)xPortGetMinimumEverFreeHeapSize(), (unsigned long)uxTaskGetNumberOfTasks(),
                   (unsigned long)sd.read_failures, (unsigned long)sd.write_failures,
                   (unsigned long)sd.write_retries, (unsigned long)sd.write_recovered,
                   (unsigned long)sd.timeouts, (unsigned long)sd.max_write_ms,
@@ -615,19 +668,143 @@ static void handle_get_accounting(struct tcp_pcb *pcb)
                   (unsigned long)storage.submitted, (unsigned long)storage.completed_ok,
                   (unsigned long)storage.completed_fail, (unsigned long)storage.queue_full,
                   (unsigned long)storage.lock_timeouts, (unsigned long)s_storage_callback_failures,
+                  (unsigned long)media.card_present, (unsigned long)media.drive_ready, (unsigned long)media.mounted,
+                  (unsigned long)media.removals, (unsigned long)media.insertions,
+                  (unsigned long)media.drive_faults, (unsigned long)media.drive_recoveries,
+                  (unsigned long)media.remount_attempts, (unsigned long)media.remount_ok,
+                  (unsigned long)media.remount_fail, (unsigned long)media.verify_failures,
+                  (unsigned long)media.disk_init_attempts, (unsigned long)media.disk_init_failures,
                   (unsigned long)s_sse_delivered, (unsigned long)s_sse_pool_exhausted,
                   (unsigned long)s_sse_post_failed,
                   (unsigned long)diag.uptime_ms, (unsigned long)diag.boot_count,
                   (unsigned long)diag.reset_flags);
     if (n <= 0 || n >= (int)sizeof(body))
+    {
+        send_json_overflow(pcb);
         return;
+    }
+    {
+        HealthMonitor_Stats_t wd;
+        uint32_t p_start_ms, p_stop_ms, p_start_cyc, p_stop_cyc;
+        HealthMonitor_GetStats(&wd);
+        HealthMonitor_GetProbe(&p_start_ms, &p_stop_ms, &p_start_cyc, &p_stop_cyc);
+        n += snprintf(body + n, sizeof(body) - (size_t)n,
+                      ",\"wd_enabled\":%u,\"wd_configured\":%u,\"wd_feeds\":%lu,\"wd_withheld\":%lu,"
+                      "\"wd_max_service_gap_ms\":%lu,\"wd_max_beat_gap_ms\":%lu,"
+                      "\"wd_last_fail_task\":%u,\"wd_reset_by_iwdg\":%u,"
+                      "\"wd_pr\":%lu,\"wd_rlr\":%lu,"
+                      "\"wd_probe_ms\":%lu,\"wd_probe_cycles\":%lu,"
+                      "\"wd_probe_start_ms\":%lu,\"wd_probe_stop_ms\":%lu,"
+                      "\"rx_irq_to_task_min_us\":%lu,\"rx_irq_to_task_avg_us\":%lu,"
+                      "\"rx_irq_to_task_max_us\":%lu,\"rx_irq_to_task_samples\":%lu,"
+                      "\"rx_irq_to_task_over_1ms\":%lu,"
+                      "\"rx_process_min_us\":%lu,\"rx_process_avg_us\":%lu,"
+                      "\"rx_process_max_us\":%lu,\"rx_process_samples\":%lu,"
+                      "\"rx_process_over_1ms\":%lu,\"dmasr\":%lu,"
+                      "\"rx_max_frame_len\":%lu,\"rx_len_corrected\":%lu,\"rx_len_unverifiable\":%lu,\"rx_last_raw_len\":%lu,\"rx_last_fixed_len\":%lu,\"rx_last_tail\":%lu,"
+                      "\"rx_frames_ge_1024\":%lu,"
+                      "\"rx_frames_ge_1400\":%lu,"
+                      "\"tx_frames\":%lu,\"tx_max_len\":%lu,\"tx_failures\":%lu,\"tx_last_err\":%lu,"
+                      "\"rx_last_tot_len\":%lu,\"rx_last_ip_total_len\":%lu,\"rx_last_etype\":%lu,"
+                      "\"rx_probe_ihl\":%lu,\"rx_probe_icmp_type\":%lu,\"rx_probe_icmp_sum\":%lu,"
+                      "\"rx_probe_icmp_verify\":%lu,\"rx_probe_dmasr\":%lu,"
+                      "\"rx_probe_last\":%lu,\"rx_probe_beyond\":%lu,\"rx_probe_count\":%lu,"
+                      "\"log_stored\":%lu,\"log_unpersisted\":%lu,\"log_queue_dropped\":%lu,"
+                      "\"log_queue_high_water\":%lu,\"log_segment_index\":%lu,\"log_segments\":%lu,"
+                      "\"log_segment_bytes\":%lu,\"log_tail_repairs\":%lu,\"log_last_error\":%ld,"
+                      "\"log_storage_full\":%u}",
+                      (unsigned)wd.enabled, (unsigned)wd.configured,
+                      (unsigned long)wd.feeds,
+                      (unsigned long)wd.withheld, (unsigned long)wd.max_service_gap_ms,
+                      (unsigned long)wd.max_beat_gap_ms[HEALTH_TASK_ETH_RX],
+                      (unsigned)wd.last_fail_task, (unsigned)wd.reset_by_iwdg,
+                      (unsigned long)(IWDG->PR & 7U), (unsigned long)(IWDG->RLR & 0xFFFU),
+                      (unsigned long)(p_stop_ms - p_start_ms),
+                      (unsigned long)(p_stop_cyc - p_start_cyc),
+                      (unsigned long)p_start_ms, (unsigned long)p_stop_ms,
+                      (unsigned long)ethernet.rx_irq_to_task_min_us,
+                      (unsigned long)ethernet.rx_irq_to_task_avg_us,
+                      (unsigned long)ethernet.rx_irq_to_task_max_us,
+                      (unsigned long)ethernet.rx_irq_to_task_samples,
+                      (unsigned long)ethernet.rx_irq_to_task_over_1ms,
+                      (unsigned long)ethernet.rx_process_min_us,
+                      (unsigned long)ethernet.rx_process_avg_us,
+                      (unsigned long)ethernet.rx_process_max_us,
+                      (unsigned long)ethernet.rx_process_samples,
+                      (unsigned long)ethernet.rx_process_over_1ms,
+                      (unsigned long)ethernet.dmasr,
+                      (unsigned long)ethernet.rx_max_frame_len,
+                      (unsigned long)ethernet.rx_len_corrected, (unsigned long)ethernet.rx_len_unverifiable, (unsigned long)ethernet.rx_last_raw_len,
+                      (unsigned long)ethernet.rx_last_fixed_len, (unsigned long)ethernet.rx_last_tail,
+                      (unsigned long)ethernet.rx_frames_ge_1024,
+                      (unsigned long)ethernet.rx_frames_ge_1400,
+                      (unsigned long)ethernet.tx_frames,
+                      (unsigned long)ethernet.tx_max_len,
+                      (unsigned long)ethernet.tx_failures,
+                      (unsigned long)ethernet.tx_last_err,
+                      (unsigned long)ethernet.rx_last_tot_len,
+                      (unsigned long)ethernet.rx_last_ip_total_len,
+                      (unsigned long)ethernet.rx_last_etype,
+                      (unsigned long)ethernet.rx_probe_ihl,
+                      (unsigned long)ethernet.rx_probe_icmp_type,
+                      (unsigned long)ethernet.rx_probe_icmp_sum,
+                      (unsigned long)ethernet.rx_probe_icmp_verify,
+                      (unsigned long)ethernet.rx_probe_dmasr,
+                      (unsigned long)ethernet.rx_probe_last,
+                      (unsigned long)ethernet.rx_probe_beyond,
+                      (unsigned long)ethernet.rx_probe_count,
+                      (unsigned long)logstats.stored, (unsigned long)logstats.unpersisted,
+                      (unsigned long)logstats.queue_dropped, (unsigned long)logstats.queue_high_water,
+                      (unsigned long)logstats.segment_index, (unsigned long)logstats.segments,
+                      (unsigned long)logstats.segment_bytes, (unsigned long)logstats.tail_repairs,
+                      (long)logstats.last_error, (unsigned)logstats.storage_full);
+        if (n <= 0 || n >= (int)sizeof(body))
+        {
+            send_json_overflow(pcb);
+            return;
+        }
+    }
     int r = snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", n, body);
     if (r > 0 && r < (int)sizeof(response))
+    {
         send_response(pcb, response);
+    }
+    else
+    {
+        send_json_overflow(pcb);
+    }
+}
+
+/**
+ * @brief Reports a response that did not fit its buffer.
+ *
+ * Truncated JSON must never be sent as a success: a client parsing a partial
+ * document would silently see fewer records or fields than actually exist.
+ * @param pcb Connection to answer with the overflow response.
+ */
+static void send_json_overflow(struct tcp_pcb *pcb)
+{
+    static const char msg[] = "{\"error\":\"response_buffer_too_small\"}";
+    char hdr[224];
+    int r = snprintf(hdr, sizeof(hdr),
+                     "HTTP/1.1 500 Internal Server Error\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Cache-Control: no-store\r\n"
+                     "Access-Control-Allow-Origin: *\r\n"
+                     "Content-Length: %u\r\n"
+                     "Connection: close\r\n\r\n%s",
+                     (unsigned)(sizeof(msg) - 1U), msg);
+    if (r > 0 && r < (int)sizeof(hdr))
+    {
+        send_response(pcb, hdr);
+    }
 }
 
 /**
  * @brief Converts a part/whole ratio to a tenths-of-percent integer.
+ * @param part Numerator.
+ * @param whole Denominator.
+ * @return Percentage in tenths, or 0 when whole is 0.
  */
 static uint32_t ratio_pct_x10(uint32_t part, uint32_t whole)
 {
@@ -639,6 +816,10 @@ static uint32_t ratio_pct_x10(uint32_t part, uint32_t whole)
     return (uint32_t)(v / whole);
 }
 
+/**
+ * @brief Reports the supervised task health table as JSON.
+ * @param pcb Connection to answer.
+ */
 static void handle_get_task_health(struct tcp_pcb *pcb)
 {
 #define TASK_HEALTH_MAX_TASKS 16
@@ -647,7 +828,7 @@ static void handle_get_task_health(struct tcp_pcb *pcb)
     static UBaseType_t prev_count = 0;
     static uint8_t prev_valid = 0;
     static uint32_t prev_total = 0;
-    static char body[3072], response[3328];
+    static char body[HTTP_JSON_BODY_MAX], response[HTTP_JSON_RESP_MAX];
 
     uint32_t total_run_time = 0;
     UBaseType_t count = uxTaskGetSystemState(tasks, TASK_HEALTH_MAX_TASKS, &total_run_time);
@@ -733,7 +914,8 @@ static void handle_get_task_health(struct tcp_pcb *pcb)
 
     int r = snprintf(response, sizeof(response),
                      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n"
-                     "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", n, body);
+                     "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                     n, body);
     if (r > 0 && r < (int)sizeof(response))
     {
         send_response(pcb, response);
@@ -744,6 +926,9 @@ static void handle_get_task_health(struct tcp_pcb *pcb)
 /**
  * @brief Case-insensitive comparison of a query parameter value against a
  *        keyword. The value ends at '&', ' ', '\r' or end of string.
+ * @param value Query value taken from the request URL.
+ * @param keyword Value to compare against.
+ * @return true when both name the same option.
  */
 static bool query_value_equals(const char *value, const char *keyword)
 {
@@ -772,6 +957,8 @@ static bool query_value_equals(const char *value, const char *keyword)
  * filtering. Filters are applied by the storage owner while it scans the log,
  * so a page always contains up to `limit` matching records and never requires
  * the whole history to be transferred.
+ * @param pcb Connection to answer.
+ * @param client Client state holding the paging cursor.
  */
 static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -812,20 +999,30 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         }
         v = strstr(query, "limit=");
         if (v != NULL)
+        {
             (void)sscanf(v + 6, "%lu", &limit);
+        }
 
         v = strstr(query, "protocol=");
         if (v != NULL)
         {
             const char *val = v + 9;
             if (query_value_equals(val, "GOOSE"))
+            {
                 proto_filter = (uint8_t)STORAGE_ALERT_PROTO_GOOSE;
+            }
             else if (query_value_equals(val, "SV"))
+            {
                 proto_filter = (uint8_t)STORAGE_ALERT_PROTO_SV;
+            }
             else if (query_value_equals(val, "MMS"))
+            {
                 proto_filter = (uint8_t)STORAGE_ALERT_PROTO_MMS;
+            }
             else if (!query_value_equals(val, "ALL"))
+            {
                 bad_filter = true;
+            }
         }
 
         v = strstr(query, "severity=");
@@ -833,19 +1030,31 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         {
             const char *val = v + 9;
             if (query_value_equals(val, "CRITICAL"))
+            {
                 sev_filter = (uint8_t)STORAGE_ALERT_SEV_CRITICAL;
+            }
             else if (query_value_equals(val, "HIGH"))
+            {
                 sev_filter = (uint8_t)STORAGE_ALERT_SEV_HIGH;
+            }
             else if (query_value_equals(val, "WARNING"))
+            {
                 sev_filter = (uint8_t)STORAGE_ALERT_SEV_WARNING;
+            }
             else if (query_value_equals(val, "INFO"))
+            {
                 sev_filter = (uint8_t)STORAGE_ALERT_SEV_INFO;
+            }
             else if (!query_value_equals(val, "ALL"))
+            {
                 bad_filter = true;
+            }
         }
     }
     if (limit == 0 || limit > 40)
+    {
         limit = 40;
+    }
 
     if (bad_filter)
     {
@@ -931,9 +1140,6 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
         return;
     }
 
-    /* Hand the FatFs scan to the storage owner; the TCP/IP thread must not
-     * open or read files. Ownership of the response buffer moves to the
-     * request and is returned by do_storage_complete(). */
     StorageRequest_t *req = StorageService_Acquire();
     if (req == NULL)
     {
@@ -987,10 +1193,11 @@ static void handle_get_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
  *
  * Returns the alert totals maintained in RAM. No file is opened and no record
  * is transferred, so a dashboard can display the count cheaply.
+ * @param pcb Connection to answer.
  */
 static void handle_get_alerts_summary(struct tcp_pcb *pcb)
 {
-    static char body[384], response[640];
+    static char body[HTTP_JSON_SMALL_BODY_MAX], response[HTTP_JSON_SMALL_RESP_MAX];
 
     uint32_t total = Security_GetAlertCount();
     uint32_t tot = 0, goose = 0, sv = 0, mms = 0;
@@ -1028,6 +1235,8 @@ static void handle_get_alerts_summary(struct tcp_pcb *pcb)
 /**
  * @brief Handles DELETE /api/alerts and POST /api/alerts/clear requests.
  *        The alert log is truncated by the storage owner, not the TCP/IP thread.
+ * @param pcb Connection to answer.
+ * @param client Client state owning the request.
  */
 static void handle_clear_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -1070,6 +1279,9 @@ static void handle_clear_alerts(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 
 /**
  * @brief Sends a JSON error response with a computed Content-Length.
+ * @param pcb Connection to answer.
+ * @param status HTTP status line text.
+ * @param json JSON body to send.
  */
 static void send_json_error(struct tcp_pcb *pcb, const char *status, const char *json)
 {
@@ -1090,6 +1302,7 @@ static void send_json_error(struct tcp_pcb *pcb, const char *status, const char 
 /**
  * @brief Runs on the TCP/IP thread when the storage owner finishes a request.
  *        Validates that the client is still the one that submitted the request.
+ * @param ctx Context passed to the deferred call.
  */
 static void do_storage_complete(void *ctx)
 {
@@ -1266,6 +1479,7 @@ static void do_storage_complete(void *ctx)
 /**
  * @brief Storage-owner completion hook. Runs on the storage task; must not block
  *        on filesystem or TCP/IP resources.
+ * @param req Completed storage request.
  */
 static void storage_complete_hook(StorageRequest_t *req)
 {
@@ -1289,6 +1503,11 @@ static void storage_complete_hook(StorageRequest_t *req)
 
 /**
  * @brief Forwards incoming SCD payload chunks to storage with bounded flow control.
+ * @param pcb Connection the data arrived on.
+ * @param client Client state owning the upload.
+ * @param data Body bytes received so far.
+ * @param len Number of bytes in this fragment.
+ * @return true when the upload may continue.
  */
 static bool process_scd_data(struct tcp_pcb *pcb, HTTP_API_Client_t *client, const uint8_t *data, uint16_t len)
 {
@@ -1341,6 +1560,8 @@ static bool process_scd_data(struct tcp_pcb *pcb, HTTP_API_Client_t *client, con
  * performs the actual file sync and then signals SCD_Config_Task to reload.
  * We send the HTTP 202 Accepted response immediately and close the connection.
  * The config reload completes asynchronously on the SCD_ConfigTask.
+ * @param pcb Connection to answer.
+ * @param client Client state owning the request.
  */
 static void finish_post(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -1372,6 +1593,8 @@ static void finish_post(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 
 /**
  * @brief Closes a TCP connection cleanly and frees associated client resources.
+ * @param pcb Connection being closed.
+ * @param client Client state to release.
  */
 static void api_close_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -1406,6 +1629,8 @@ static void api_close_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 /**
  * @brief Aborts a TCP connection immediately (sends RST and frees PCB).
  *        Must be used when returning ERR_ABRT from callbacks.
+ * @param pcb Connection being aborted.
+ * @param client Client state to release.
  */
 static void api_abort_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 {
@@ -1434,6 +1659,8 @@ static void api_abort_conn(struct tcp_pcb *pcb, HTTP_API_Client_t *client)
 
 /**
  * @brief TCP error callback invoked on connection errors.
+ * @param arg Callback argument (unused).
+ * @param err Error reported by lwIP.
  */
 static void api_err(void *arg, err_t err)
 {
@@ -1454,6 +1681,11 @@ static void api_err(void *arg, err_t err)
 
 /**
  * @brief TCP receive callback handling incoming HTTP requests.
+ * @param arg Callback argument (unused).
+ * @param pcb Connection that received data.
+ * @param p Received packet buffer, NULL when the peer closed the connection.
+ * @param err Accumulated lwIP error for the connection.
+ * @return ERR_OK when the data was consumed, or an abort code.
  */
 static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 {
@@ -1491,8 +1723,6 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
     if (client->storage_req != NULL)
     {
-        /* The storage owner is still serving this connection; ignore pipelined
-         * data instead of queueing a second filesystem request. */
         tcp_recved(pcb, p->tot_len);
         pbuf_free(p);
         return ERR_OK;
@@ -1816,6 +2046,10 @@ static err_t api_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
 
 /**
  * @brief TCP accept callback for incoming client connections on the API port.
+ * @param arg Callback argument (unused).
+ * @param newpcb Newly accepted connection.
+ * @param err lwIP error for the new connection.
+ * @return ERR_OK to keep the connection, or an abort code to refuse it.
  */
 static err_t api_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
@@ -1888,15 +2122,38 @@ void HTTP_API_Init(void)
 
     tcp_accept(api_pcb, api_accept);
     s_http_initialized = 1;
+    SysLog_Print(SYSLOG_LEVEL_INFO, "HTTP", "Listening on port %d (API and dashboard ready)", HTTP_API_PORT);
     SysLog_Print(SYSLOG_LEVEL_INFO, "HTTP", "Server listening on port %d", HTTP_API_PORT);
 }
 
 /**
  * @brief Returns 1 if the HTTP server listening PCB is active, 0 otherwise.
+ * @return 1 while the listener is active, 0 otherwise.
  */
 uint8_t HTTP_API_IsListening(void)
 {
     return (api_pcb != NULL && api_pcb->state == LISTEN);
+}
+
+/*
+ * Human-readable server state for boot/link diagnostics.
+ *
+ * The listener is created by HTTP_API_Init(), which the storage-owner task runs
+ * after lwIP starts. A link-up event can arrive before that, so the diagnostic
+ * must distinguish "not initialised yet" from "initialised but not listening"
+ * instead of reporting a single "NOT listening" for both.
+ */
+const char *HTTP_API_StateString(void)
+{
+    if (HTTP_API_IsListening())
+    {
+        return "listening:8080";
+    }
+    if (!s_http_initialized)
+    {
+        return "starting";
+    }
+    return "unavailable";
 }
 
 /**
@@ -1918,6 +2175,7 @@ void HTTP_API_EnsureListening(void)
 
 /**
  * @brief Broadcasts an SSE alert payload to all connected SSE clients.
+ * @param ctx Context passed to the deferred call.
  */
 static void do_broadcast_alert(void *ctx)
 {
@@ -1973,6 +2231,8 @@ static void do_broadcast_alert(void *ctx)
 
 /**
  * @brief Enqueues an alert JSON line for broadcast to all connected SSE clients.
+ * @param json_line NDJSON line to send to the connected SSE clients.
+ * @param len Length of json_line.
  */
 void HTTP_API_BroadcastAlert(const char *json_line, uint16_t len)
 {
