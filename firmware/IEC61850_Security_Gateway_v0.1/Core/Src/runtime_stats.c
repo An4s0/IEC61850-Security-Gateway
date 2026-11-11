@@ -8,6 +8,9 @@
  */
 static uint8_t s_initialized = 0;
 
+/**
+ * @brief Starts the free running TIM2 counter used as the runtime statistics time base.
+ */
 void RunTimeStats_Init(void)
 {
     if (s_initialized)
@@ -19,7 +22,6 @@ void RunTimeStats_Init(void)
 
     uint32_t pclk1 = HAL_RCC_GetPCLK1Freq();
     uint32_t hclk = HAL_RCC_GetHCLKFreq();
-    /* The APB1 timer clock is 2x PCLK1 unless the APB1 prescaler is 1. */
     uint32_t tim_clk = (pclk1 == hclk) ? pclk1 : (pclk1 * 2U);
 
     uint32_t psc = tim_clk / RUNTIME_STATS_COUNTER_HZ;
@@ -43,6 +45,10 @@ void RunTimeStats_Init(void)
     s_initialized = 1;
 }
 
+/**
+ * @brief Reads the current runtime statistics counter value.
+ * @return Free running 32-bit TIM2 count in RUNTIME_STATS_COUNTER_HZ ticks.
+ */
 uint32_t RunTimeStats_GetCount(void)
 {
     if (!s_initialized)

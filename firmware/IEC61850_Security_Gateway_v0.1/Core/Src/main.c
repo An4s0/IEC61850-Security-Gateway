@@ -38,6 +38,7 @@
 #include "system_logger.h"
 #include "storage_service.h"
 #include "sys_diag.h"
+#include "health_monitor.h"
 #include "lwip/tcpip.h"
 
 /* USER CODE END Includes */
@@ -210,9 +211,10 @@ int main(void)
   Mms_Init();
   /* USER CODE END RTOS_THREADS */
 
+  HealthMonitor_Init();
+
   /* Start scheduler */
   osKernelStart();
-
   /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
@@ -366,12 +368,24 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/**
+ * @brief Redirects stdout to the debug serial port.
+ * @param ch Character to transmit.
+ * @return The character written.
+ */
 int __io_putchar(int ch)
 {
   HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;
 }
 
+/**
+ * @brief Newlib write hook that sends a buffer to the debug serial port.
+ * @param file Unused file descriptor.
+ * @param ptr Buffer to transmit.
+ * @param len Number of bytes to transmit.
+ * @return Number of bytes written.
+ */
 int _write(int file, char *ptr, int len)
 {
   (void)file;
@@ -398,7 +412,7 @@ void StartDefaultTask(void const *argument)
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
   SysLog_Init();
-  SysLog_Print(SYSLOG_LEVEL_INFO, "BOOT", "IEC 61850 Security Gateway started. STM32F767ZI.");
+  SysLog_Print(SYSLOG_LEVEL_INFO, "BOOT", "IEC 61850 Security Gateway started.");
   SystemConfig_Init();
   SCD_Storage_Init();
   SCD_Config_Init();
@@ -417,6 +431,8 @@ void StartDefaultTask(void const *argument)
   for (;;)
   {
     StorageService_Run();
+    HealthMonitor_Beat(HEALTH_TASK_STORAGE);
+    HealthMonitor_Service();
   }
   /* USER CODE END 5 */
 }

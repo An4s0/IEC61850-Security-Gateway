@@ -59,6 +59,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/sdmmc.c
     Core/Src/system_config.c
     Core/Src/system_logger.c
+    Core/Src/health_monitor.c
 )
 
 # Add include paths

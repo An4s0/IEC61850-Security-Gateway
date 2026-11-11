@@ -14,6 +14,9 @@ static volatile uint32_t s_boot_count __attribute__((section(".noinit")));
 static uint32_t s_reset_flags = 0;
 static uint32_t s_boot_count_latched = 1;
 
+/**
+ * @brief Latches and clears the reset flags and advances the retained boot counter.
+ */
 void SysDiag_Init(void)
 {
     s_reset_flags = RCC->CSR;
@@ -32,6 +35,10 @@ void SysDiag_Init(void)
     s_boot_count_latched = s_boot_count;
 }
 
+/**
+ * @brief Copies the current uptime and the latched boot diagnostics into the caller's structure.
+ * @param out Destination structure; the call is ignored when NULL.
+ */
 void SysDiag_Get(SysDiag_Stats_t *out)
 {
     if (out == NULL)
