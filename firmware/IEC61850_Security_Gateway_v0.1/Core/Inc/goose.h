@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define GOOSE_MAX_FRAME_SIZE 512
+#define GOOSE_MAX_FRAME_SIZE 1536
 #define GOOSE_FRAME_POOL_SIZE 16
 
 typedef struct

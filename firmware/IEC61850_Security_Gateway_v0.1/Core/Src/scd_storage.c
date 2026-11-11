@@ -279,7 +279,9 @@ void SCD_Storage_Task(void const *argument)
                     s_storage_result_ok = false;
                     SysLog_Print(SYSLOG_LEVEL_ERROR, "STORAGE", "SCD end SD lock timeout");
                     if (SCDEndDoneSemHandle != NULL)
+                    {
                         osSemaphoreRelease(SCDEndDoneSemHandle);
+                    }
                     continue;
                 }
                 if (s_upload_ok)

@@ -1,5 +1,6 @@
 #include "raw_eth.h"
 #include "mms.h"
+#include "health_monitor.h"
 #include "main.h"
 #include "system_config.h"
 #include "system_logger.h"
@@ -487,7 +488,10 @@ void Mms_Enqueue(struct pbuf *p)
 {
     if (p == NULL || MmsPoolHandle == NULL || p->tot_len > MMS_MAX_FRAME_SIZE)
     {
-        if (p != NULL) Accounting_Increment(ACCOUNT_MMS, ACCOUNT_DROP_SIZE_OR_INIT);
+        if (p != NULL)
+        {
+            Accounting_Increment(ACCOUNT_MMS, ACCOUNT_DROP_SIZE_OR_INIT);
+        }
         return;
     }
 
@@ -530,7 +534,8 @@ void Mms_Task(void const *argument)
             continue;
         }
 
-        osEvent evt = osMessageGet(MMSQueueHandle, osWaitForever);
+        osEvent evt = osMessageGet(MMSQueueHandle, HEALTH_BEAT_PERIOD_MS);
+        HealthMonitor_Beat(HEALTH_TASK_MMS);
         if (evt.status == osEventMessage)
         {
             Mms_Frame_t *frame = (Mms_Frame_t *)evt.value.v;

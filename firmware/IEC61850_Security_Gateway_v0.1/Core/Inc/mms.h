@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define MMS_MAX_FRAME_SIZE 512
+#define MMS_MAX_FRAME_SIZE 1536
 #define MMS_FRAME_POOL_SIZE 16
 
 typedef struct

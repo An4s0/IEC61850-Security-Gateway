@@ -15,6 +15,28 @@ static bool s_initialized = false;
 static osMutexId s_sys_config_mutex = NULL;
 osMutexDef(SysConfigMutex);
 
+static volatile uint32_t s_config_seq = 1U;
+#define CONFIG_SNAPSHOT_RETRIES 4U
+
+#ifndef CONFIG_GET_LEGACY_MUTEX
+#define CONFIG_GET_LEGACY_MUTEX 0
+#endif
+
+/**
+ * @brief Publishes a new configuration snapshot for lock-free readers.
+ *        Must be called with the configuration mutex held.
+ */
+static void publish_config(const SystemConfig_t *src)
+{
+    __DMB();
+    s_config_seq++; /* odd: write in progress, readers retry */
+    __DMB();
+    s_active_config = *src;
+    __DMB();
+    s_config_seq++; /* even: snapshot consistent */
+    __DMB();
+}
+
 static const SystemConfig_t s_default_config = {
     .goose = {
         .timing_check_enabled = true,
@@ -148,6 +170,8 @@ void SystemConfig_Init(void)
 
     s_active_config = s_default_config;
     s_initialized = true;
+    __DMB();
+    s_config_seq = 2U; /* published, even */
 
     if (!SystemConfig_LoadFromSD())
     {
@@ -163,7 +187,11 @@ void SystemConfig_Init(void)
 }
 
 /**
- * @brief Thread-safe retrieval of current active configuration.
+ * @brief Thread-safe, non-blocking retrieval of the active configuration.
+ *
+ * Used by the Ethernet RX path and every protocol task. It never waits for the
+ * configuration mutex in the normal case: it copies the published snapshot and
+ * validates it with the publication sequence, retrying if a writer was active.
  * @param dest Pointer to destination structure.
  */
 void SystemConfig_Get(SystemConfig_t *dest)
@@ -173,16 +201,43 @@ void SystemConfig_Get(SystemConfig_t *dest)
         return;
     }
 
-    lock_config();
-    if (!s_initialized)
+    if (s_sys_config_mutex == NULL)
     {
         *dest = s_default_config;
+        return;
     }
-    else
-    {
-        *dest = s_active_config;
-    }
+
+#if CONFIG_GET_LEGACY_MUTEX
+    lock_config();
+    *dest = s_initialized ? s_active_config : s_default_config;
     unlock_config();
+    return;
+#else
+
+    for (uint32_t attempt = 0U; attempt < CONFIG_SNAPSHOT_RETRIES; attempt++)
+    {
+        uint32_t seq_before = s_config_seq;
+        if ((seq_before & 1U) != 0U)
+        {
+            continue; /* writer in progress */
+        }
+
+        __DMB();
+        SystemConfig_t snapshot = s_active_config;
+        __DMB();
+
+        if (s_config_seq == seq_before)
+        {
+            *dest = snapshot;
+            return;
+        }
+    }
+
+    /* A writer kept winning; fall back to the mutex instead of spinning. */
+    lock_config();
+    *dest = s_initialized ? s_active_config : s_default_config;
+    unlock_config();
+#endif /* CONFIG_GET_LEGACY_MUTEX */
 }
 
 /**
@@ -204,7 +259,7 @@ bool SystemConfig_Set(const SystemConfig_t *src)
     }
 
     lock_config();
-    s_active_config = *src;
+    publish_config(src);
     unlock_config();
 
     return true;
@@ -216,7 +271,7 @@ bool SystemConfig_Set(const SystemConfig_t *src)
 void SystemConfig_ResetToDefaults(void)
 {
     lock_config();
-    s_active_config = s_default_config;
+    publish_config(&s_default_config);
     unlock_config();
 }
 
@@ -297,7 +352,10 @@ int SystemConfig_ToJson(const SystemConfig_t *cfg, char *buf, size_t max_len)
 }
 
 /**
- * @brief Finds a JSON key and returns a pointer to its value.
+ * @brief Finds a JSON key and returns a pointer to the value that follows its colon.
+ * @param json JSON text to search.
+ * @param key Bare key name, without quotes.
+ * @return Pointer to the value text, or NULL when the key is absent or malformed.
  */
 static const char *find_key(const char *json, const char *key)
 {
@@ -328,6 +386,10 @@ static const char *find_key(const char *json, const char *key)
 
 /**
  * @brief Parses a Boolean value associated with a JSON key.
+ * @param json JSON text to search.
+ * @param key Bare key name, without quotes.
+ * @param out Destination for the parsed value, left untouched on failure.
+ * @return true when a Boolean was recognised, false when absent or unrecognised.
  */
 static bool parse_bool(const char *json, const char *key, bool *out)
 {
@@ -358,6 +420,10 @@ static bool parse_bool(const char *json, const char *key, bool *out)
 
 /**
  * @brief Parses an unsigned integer associated with a JSON key.
+ * @param json JSON text to search.
+ * @param key Bare key name, without quotes.
+ * @param out Destination for the parsed value, left untouched on failure.
+ * @return true when a decimal number was recognised, false when absent or not numeric.
  */
 static bool parse_uint(const char *json, const char *key, uint32_t *out)
 {
@@ -389,7 +455,12 @@ static bool parse_uint(const char *json, const char *key, uint32_t *out)
 }
 
 /**
- * @brief Parses a string value associated with a JSON key.
+ * @brief Parses a quoted string value associated with a JSON key.
+ * @param json JSON text to search.
+ * @param key Bare key name, without quotes.
+ * @param out Destination buffer, always NUL terminated on success.
+ * @param max_len Size of the destination buffer.
+ * @return true when a non-empty string was copied, false otherwise.
  */
 static bool parse_str(const char *json, const char *key, char *out, size_t max_len)
 {
@@ -502,6 +573,9 @@ typedef struct
 
 /**
  * @brief Calculates the CRC-32 checksum of a data buffer.
+ * @param buf Buffer to checksum.
+ * @param len Number of bytes to process.
+ * @return CRC-32 value (reflected, polynomial 0xEDB88320).
  */
 static uint32_t sys_crc32(const void *buf, size_t len)
 {
@@ -519,8 +593,8 @@ static uint32_t sys_crc32(const void *buf, size_t len)
 }
 
 /**
- * @brief Persists the active configuration to SD card storage (0:/system_config.json).
- * @return true on success, false on error.
+ * @brief Persists the active configuration as a CRC-protected binary record.
+ * @return true when the record was written and synced, false on SD or write error.
  */
 bool SystemConfig_SaveToSD(void)
 {
@@ -566,8 +640,8 @@ bool SystemConfig_SaveToSD(void)
 }
 
 /**
- * @brief Loads the active configuration from SD card storage (0:/system_config.json).
- * @return true on success, false if file does not exist or parse error.
+ * @brief Loads the configuration from the binary record, falling back to the legacy JSON file.
+ * @return true when a valid configuration was published, false when nothing usable was found.
  */
 bool SystemConfig_LoadFromSD(void)
 {
@@ -596,7 +670,7 @@ bool SystemConfig_LoadFromSD(void)
             if (calc_crc == bin.crc32 && SystemConfig_Validate(&bin.config))
             {
                 lock_config();
-                s_active_config = bin.config;
+                publish_config(&bin.config);
                 unlock_config();
                 Security_UnlockSD();
                 return true;
@@ -624,7 +698,7 @@ bool SystemConfig_LoadFromSD(void)
             if (SystemConfig_FromJson(s_load_buf, &loaded))
             {
                 lock_config();
-                s_active_config = loaded;
+                publish_config(&loaded);
                 unlock_config();
                 SysLog_Print(SYSLOG_LEVEL_INFO, "CONFIG", "Migrated legacy JSON config to %s", SYS_CONFIG_FILE);
                 f_unlink(SYS_CONFIG_LEGACY_FILE);

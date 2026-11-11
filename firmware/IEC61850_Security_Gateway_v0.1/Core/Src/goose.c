@@ -1,5 +1,6 @@
 #include "raw_eth.h"
 #include "goose.h"
+#include "health_monitor.h"
 #include "main.h"
 #include "system_config.h"
 #include "system_logger.h"
@@ -489,7 +490,10 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
         SysLog_Print(SYSLOG_LEVEL_WARN, "GOOSE", "MAC RX timestamp unavailable; using millisecond software timing");
         rx_warning_reported = true;
     }
-    else if (frame->rx_timestamp_valid) rx_warning_reported = false;
+    else if (frame->rx_timestamp_valid)
+    {
+        rx_warning_reported = false;
+    }
     uint32_t now_ms = frame->rx_timestamp_ms;
     ParsedGoose_t p;
 
@@ -632,7 +636,10 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
             uint32_t hz = HAL_RCC_GetHCLKFreq();
             bool hardware_timing = frame->rx_timestamp_valid && st->last_rx_valid && hz != 0U;
             uint64_t elapsed_ticks = Goose_RxDelta(frame->rx_timestamp_ticks, st->last_rx_ticks);
-            if (hardware_timing) delta = Goose_RxElapsedMs(elapsed_ticks, hz);
+            if (hardware_timing)
+            {
+                delta = Goose_RxElapsedMs(elapsed_ticks, hz);
+            }
 
             uint32_t ttl_ms = (st->last_ttl_ms > 0)
                                   ? st->last_ttl_ms
@@ -699,8 +706,7 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
                 }
                 else
                 {
-                    bool is_fast = hardware_timing ? Goose_RxBeforeMs(elapsed_ticks, hz, min_time) :
-                                   (delta < min_time && min_time - delta > 1U);
+                    bool is_fast = hardware_timing ? Goose_RxBeforeMs(elapsed_ticks, hz, min_time) : (delta < min_time && min_time - delta > 1U);
                     if (sys_cfg.goose.timing_check_enabled && is_fast)
                     {
                         s_goose_event.type = GOOSE_EVENT_TIMING_FAST;
@@ -713,9 +719,11 @@ GOOSE_EventType_t Goose_IDS_Process(const Goose_Frame_t *frame)
                                      (unsigned long)(us / 1000U), (unsigned long)(us % 1000U), (unsigned long)min_time);
                         }
                         else
+                        {
                             snprintf(s_goose_event.details, sizeof(s_goose_event.details),
                                      "Fast: %lu ms < minTime %lu ms (software RX)",
                                      (unsigned long)delta, (unsigned long)min_time);
+                        }
                         result = GOOSE_EVENT_TIMING_FAST;
                     }
                     else if (sys_cfg.goose.timing_check_enabled && is_expired)
@@ -754,6 +762,7 @@ static Goose_Stats_t s_goose_stats = {0};
 
 /**
  * @brief Copies the current GOOSE statistics to the provided structure.
+ * @param stats Destination structure; ignored when NULL.
  */
 void Goose_GetStats(Goose_Stats_t *stats)
 {
@@ -785,7 +794,10 @@ void Goose_Enqueue(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
 {
     if (p == NULL || GoosePoolHandle == NULL || p->tot_len > GOOSE_MAX_FRAME_SIZE)
     {
-        if (p != NULL) Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_DROP_SIZE_OR_INIT);
+        if (p != NULL)
+        {
+            Accounting_Increment(ACCOUNT_GOOSE, ACCOUNT_DROP_SIZE_OR_INIT);
+        }
         return;
     }
 
@@ -834,7 +846,8 @@ void Goose_Task(void const *argument)
             continue;
         }
 
-        osEvent evt = osMessageGet(GooseQueueHandle, osWaitForever);
+        osEvent evt = osMessageGet(GooseQueueHandle, HEALTH_BEAT_PERIOD_MS);
+        HealthMonitor_Beat(HEALTH_TASK_GOOSE);
         if (evt.status == osEventMessage)
         {
             Goose_Frame_t *frame = (Goose_Frame_t *)evt.value.v;

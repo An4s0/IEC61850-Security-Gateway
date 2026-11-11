@@ -56,6 +56,7 @@ typedef struct
     uint32_t alerts_dropped_buffer_full;
     uint32_t alerts_dropped_mutex_busy;
     uint32_t alerts_purged;
+    uint32_t alert_tail_repairs;
 } Security_Stats_t;
 
 void Security_Init(void);

@@ -50,8 +50,17 @@ static uint16_t s_parse_total_goose = 0;
 static uint16_t s_parse_total_sv = 0;
 static uint16_t s_parse_total_mms = 0;
 
+static uint16_t s_cap_ieds = IDS_MAX_IEDS;
+static uint16_t s_cap_goose = IDS_MAX_GOOSE;
+static uint16_t s_cap_sv = IDS_MAX_SV;
+static uint16_t s_cap_mms = IDS_MAX_MMS;
+
 /**
  * @brief Computes standard IEEE 802.3 CRC32 checksum.
+ * @param crc Running CRC value; pass 0 for the first block.
+ * @param buf Bytes to fold into the CRC.
+ * @param len Number of bytes to process.
+ * @return Updated CRC value.
  */
 static uint32_t scd_crc32(uint32_t crc, const void *buf, size_t len)
 {
@@ -70,6 +79,9 @@ static uint32_t scd_crc32(uint32_t crc, const void *buf, size_t len)
 
 /**
  * @brief Copies a string safely ensuring null-termination.
+ * @param dst Destination buffer, always NUL terminated.
+ * @param src Source string, may be NULL.
+ * @param max_len Size of the destination buffer.
  */
 static void safe_strcpy(char *dst, const char *src, size_t max_len)
 {
@@ -88,6 +100,9 @@ static void safe_strcpy(char *dst, const char *src, size_t max_len)
 
 /**
  * @brief Parses a MAC address string ("01:0C:CD:01:00:01" or "01-0C-CD-01-00-01") into 6 bytes.
+ * @param mac_str Colon-separated MAC address text.
+ * @param mac_bytes Output buffer for the six parsed bytes.
+ * @return true when the text is a complete MAC address.
  */
 static bool parse_mac_address(const char *mac_str, uint8_t *mac_bytes)
 {
@@ -118,6 +133,8 @@ static bool parse_mac_address(const char *mac_str, uint8_t *mac_bytes)
 
 /**
  * @brief Parses an APPID value from string (base-16 hex per IEC 61850 SCL, e.g. "4000" or "0x4000").
+ * @param str Hexadecimal APPID text, optionally 0x-prefixed.
+ * @return Parsed 16-bit APPID, or 0 when the text is not valid.
  */
 static uint16_t parse_appid(const char *str)
 {
@@ -130,6 +147,8 @@ static uint16_t parse_appid(const char *str)
 
 /**
  * @brief Reads the next character from the JSON input stream.
+ * @param reader Reader to advance.
+ * @return Next character, or EOF at the end of the input.
  */
 static int json_reader_getc(json_reader_t *reader)
 {
@@ -152,6 +171,7 @@ static int json_reader_getc(json_reader_t *reader)
 
 /**
  * @brief Moves the JSON reader position back by one character.
+ * @param reader Reader whose last character is pushed back.
  */
 
 static void json_reader_ungetc(json_reader_t *reader)
@@ -164,6 +184,7 @@ static void json_reader_ungetc(json_reader_t *reader)
 
 /**
  * @brief Skips whitespace characters in the JSON input stream.
+ * @param reader Reader to advance past whitespace.
  */
 static void json_skip_whitespace(json_reader_t *reader)
 {
@@ -180,6 +201,10 @@ static void json_skip_whitespace(json_reader_t *reader)
 
 /**
  * @brief Reads and parses the next JSON token from the input stream.
+ * @param reader Reader to advance.
+ * @param val_buf Optional buffer receiving the token text.
+ * @param val_buf_size Capacity of val_buf.
+ * @return Token type, including TOK_EOF and TOK_ERROR.
  */
 static json_tok_type_t json_next_token(json_reader_t *reader, char *val_buf, size_t val_buf_size)
 {
@@ -227,7 +252,9 @@ static json_tok_type_t json_next_token(json_reader_t *reader, char *val_buf, siz
             {
                 c = json_reader_getc(reader);
                 if (c == -1)
+                {
                     break;
+                }
             }
             if (val_buf != NULL && idx < (val_buf_size - 1))
             {
@@ -308,6 +335,8 @@ static json_tok_type_t json_next_token(json_reader_t *reader, char *val_buf, siz
 
 /**
  * @brief Skips a JSON value, including nested objects and arrays.
+ * @param reader Reader positioned on the value.
+ * @param tok Token type of the value to skip.
  */
 static void json_skip_value(json_reader_t *reader, json_tok_type_t tok)
 {
@@ -319,11 +348,17 @@ static void json_skip_value(json_reader_t *reader, json_tok_type_t tok)
         {
             json_tok_type_t t = json_next_token(reader, dummy, sizeof(dummy));
             if (t == TOK_EOF || t == TOK_ERROR)
+            {
                 break;
+            }
             if (t == TOK_OBJ_START)
+            {
                 depth++;
+            }
             else if (t == TOK_OBJ_END)
+            {
                 depth--;
+            }
         }
     }
     else if (tok == TOK_ARR_START)
@@ -333,17 +368,26 @@ static void json_skip_value(json_reader_t *reader, json_tok_type_t tok)
         {
             json_tok_type_t t = json_next_token(reader, dummy, sizeof(dummy));
             if (t == TOK_EOF || t == TOK_ERROR)
+            {
                 break;
+            }
             if (t == TOK_ARR_START)
+            {
                 depth++;
+            }
             else if (t == TOK_ARR_END)
+            {
                 depth--;
+            }
         }
     }
 }
 
 /**
  * @brief Saves an in-memory configuration to a binary file with CRC32.
+ * @param path Destination file path.
+ * @param cfg Configuration to serialise.
+ * @return true when the file was written and synced.
  */
 static bool ids_bin_save_to_file(const char *path, const SCD_Config_t *cfg)
 {
@@ -446,6 +490,8 @@ static bool ids_bin_save_to_file(const char *path, const SCD_Config_t *cfg)
 
 /**
  * @brief Reads, verifies, and loads a binary configuration into a single heap-allocated block.
+ * @param path File to load.
+ * @return Allocated configuration, or NULL on error or CRC mismatch.
  */
 static SCD_Config_t *ids_bin_load_from_file(const char *path)
 {
@@ -553,6 +599,8 @@ static SCD_Config_t *ids_bin_load_from_file(const char *path)
 
 /**
  * @brief Verifies a binary configuration file on SDMMC using streaming CRC32 (zero heap allocation).
+ * @param path File to verify.
+ * @return true when the record header and CRC are valid.
  */
 static bool ids_bin_verify_file(const char *path)
 {
@@ -602,6 +650,8 @@ static bool ids_bin_verify_file(const char *path)
 /**
  * @brief Executes a safe atomic commit with backup:
  *        ids_config.new -> ids_config.bak -> ids_config.bin
+ * @param new_cfg Configuration to persist.
+ * @return true when the write and verification succeeded.
  */
 static bool ids_bin_commit(const SCD_Config_t *new_cfg)
 {
@@ -645,6 +695,8 @@ static bool ids_bin_commit(const SCD_Config_t *new_cfg)
 
 /**
  * @brief Parses the SCD file header from the JSON input stream.
+ * @param reader Reader positioned inside the header object.
+ * @param header Header structure to fill.
  */
 static void parse_scd_header(json_reader_t *reader, SCD_Header_t *header)
 {
@@ -655,12 +707,18 @@ static void parse_scd_header(json_reader_t *reader, SCD_Header_t *header)
     while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
     {
         if (tok == TOK_OBJ_START || tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_STRING)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
         if (tok != TOK_COLON)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
 
         if (strcmp(key, "fileName") == 0)
@@ -684,6 +742,8 @@ static void parse_scd_header(json_reader_t *reader, SCD_Header_t *header)
 
 /**
  * @brief Parses the access points of an IED from the JSON input stream.
+ * @param reader Reader positioned inside the access point array.
+ * @param ied IED structure receiving the access points.
  */
 static void parse_ied_access_points(json_reader_t *reader, SCD_IED_t *ied)
 {
@@ -694,19 +754,29 @@ static void parse_ied_access_points(json_reader_t *reader, SCD_IED_t *ied)
     while ((tok = json_next_token(reader, val, sizeof(val))) != TOK_ARR_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_OBJ_START)
+        {
             break;
+        }
 
         while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
         {
             if (tok == TOK_COMMA)
+            {
                 continue;
+            }
             if (tok != TOK_STRING)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
             if (tok != TOK_COLON)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
 
             if (strcmp(key, "name") == 0)
@@ -727,6 +797,8 @@ static void parse_ied_access_points(json_reader_t *reader, SCD_IED_t *ied)
 
 /**
  * @brief Parses the IED array from the JSON input stream.
+ * @param reader Reader positioned inside the IED array.
+ * @param config Configuration receiving the IEDs.
  */
 static void parse_ieds_array(json_reader_t *reader, SCD_Config_t *config)
 {
@@ -737,14 +809,18 @@ static void parse_ieds_array(json_reader_t *reader, SCD_Config_t *config)
     while ((tok = json_next_token(reader, val, sizeof(val))) != TOK_ARR_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_OBJ_START)
+        {
             break;
+        }
 
         s_parse_total_ieds++;
 
         SCD_IED_t *ied = NULL;
-        if (config->numIeds < IDS_MAX_IEDS)
+        if (config->numIeds < s_cap_ieds)
         {
             ied = &config->ieds[config->numIeds];
             memset(ied, 0, sizeof(SCD_IED_t));
@@ -753,12 +829,18 @@ static void parse_ieds_array(json_reader_t *reader, SCD_Config_t *config)
         while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
         {
             if (tok == TOK_COMMA)
+            {
                 continue;
+            }
             if (tok != TOK_STRING)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
             if (tok != TOK_COLON)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
 
             if (ied == NULL)
@@ -797,6 +879,8 @@ static void parse_ieds_array(json_reader_t *reader, SCD_Config_t *config)
 
 /**
  * @brief Parses the publisher information of a GOOSE configuration.
+ * @param reader Reader positioned inside the publisher object.
+ * @param g GOOSE control block receiving the publisher data.
  */
 static void parse_goose_publisher(json_reader_t *reader, SCD_GOOSE_t *g)
 {
@@ -807,12 +891,18 @@ static void parse_goose_publisher(json_reader_t *reader, SCD_GOOSE_t *g)
     while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_STRING)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
         if (tok != TOK_COLON)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
 
         if (strcmp(key, "ied") == 0)
@@ -840,6 +930,8 @@ static void parse_goose_publisher(json_reader_t *reader, SCD_GOOSE_t *g)
 
 /**
  * @brief Parses the timing parameters of a GOOSE configuration.
+ * @param reader Reader positioned inside the timing object.
+ * @param g GOOSE control block receiving the timing data.
  */
 static void parse_goose_timing(json_reader_t *reader, SCD_GOOSE_t *g)
 {
@@ -850,12 +942,18 @@ static void parse_goose_timing(json_reader_t *reader, SCD_GOOSE_t *g)
     while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_STRING)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
         if (tok != TOK_COLON)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
 
         if (strcmp(key, "minTimeMs") == 0)
@@ -875,6 +973,8 @@ static void parse_goose_timing(json_reader_t *reader, SCD_GOOSE_t *g)
 
 /**
  * @brief Parses the GOOSE configuration array from the JSON input stream.
+ * @param reader Reader positioned inside the GOOSE array.
+ * @param config Configuration receiving the control blocks.
  */
 static void parse_goose_array(json_reader_t *reader, SCD_Config_t *config)
 {
@@ -885,14 +985,18 @@ static void parse_goose_array(json_reader_t *reader, SCD_Config_t *config)
     while ((tok = json_next_token(reader, val, sizeof(val))) != TOK_ARR_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_OBJ_START)
+        {
             break;
+        }
 
         s_parse_total_goose++;
 
         SCD_GOOSE_t *g = NULL;
-        if (config->numGoose < IDS_MAX_GOOSE)
+        if (config->numGoose < s_cap_goose)
         {
             g = &config->goose[config->numGoose];
             memset(g, 0, sizeof(SCD_GOOSE_t));
@@ -901,12 +1005,18 @@ static void parse_goose_array(json_reader_t *reader, SCD_Config_t *config)
         while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
         {
             if (tok == TOK_COMMA)
+            {
                 continue;
+            }
             if (tok != TOK_STRING)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
             if (tok != TOK_COLON)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
 
             if (g == NULL)
@@ -918,9 +1028,13 @@ static void parse_goose_array(json_reader_t *reader, SCD_Config_t *config)
             if (strcmp(key, "publisher") == 0)
             {
                 if (tok == TOK_OBJ_START)
+                {
                     parse_goose_publisher(reader, g);
+                }
                 else
+                {
                     json_skip_value(reader, tok);
+                }
             }
             else if (strcmp(key, "mac") == 0)
             {
@@ -946,9 +1060,13 @@ static void parse_goose_array(json_reader_t *reader, SCD_Config_t *config)
             else if (strcmp(key, "timing") == 0)
             {
                 if (tok == TOK_OBJ_START)
+                {
                     parse_goose_timing(reader, g);
+                }
                 else
+                {
                     json_skip_value(reader, tok);
+                }
             }
             else
             {
@@ -965,6 +1083,8 @@ static void parse_goose_array(json_reader_t *reader, SCD_Config_t *config)
 
 /**
  * @brief Parses the publisher information of an SV configuration.
+ * @param reader Reader positioned inside the publisher object.
+ * @param sv SV control block receiving the publisher data.
  */
 static void parse_sv_publisher(json_reader_t *reader, SCD_SV_t *sv)
 {
@@ -975,12 +1095,18 @@ static void parse_sv_publisher(json_reader_t *reader, SCD_SV_t *sv)
     while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_STRING)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
         if (tok != TOK_COLON)
+        {
             break;
+        }
         tok = json_next_token(reader, val, sizeof(val));
 
         if (strcmp(key, "ied") == 0)
@@ -1008,6 +1134,8 @@ static void parse_sv_publisher(json_reader_t *reader, SCD_SV_t *sv)
 
 /**
  * @brief Parses the Sampled Values configuration array from the JSON input stream.
+ * @param reader Reader positioned inside the SV array.
+ * @param config Configuration receiving the control blocks.
  */
 static void parse_sv_array(json_reader_t *reader, SCD_Config_t *config)
 {
@@ -1018,14 +1146,18 @@ static void parse_sv_array(json_reader_t *reader, SCD_Config_t *config)
     while ((tok = json_next_token(reader, val, sizeof(val))) != TOK_ARR_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_OBJ_START)
+        {
             break;
+        }
 
         s_parse_total_sv++;
 
         SCD_SV_t *sv = NULL;
-        if (config->numSv < IDS_MAX_SV)
+        if (config->numSv < s_cap_sv)
         {
             sv = &config->sv[config->numSv];
             memset(sv, 0, sizeof(SCD_SV_t));
@@ -1034,12 +1166,18 @@ static void parse_sv_array(json_reader_t *reader, SCD_Config_t *config)
         while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
         {
             if (tok == TOK_COMMA)
+            {
                 continue;
+            }
             if (tok != TOK_STRING)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
             if (tok != TOK_COLON)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
 
             if (sv == NULL)
@@ -1051,9 +1189,13 @@ static void parse_sv_array(json_reader_t *reader, SCD_Config_t *config)
             if (strcmp(key, "publisher") == 0)
             {
                 if (tok == TOK_OBJ_START)
+                {
                     parse_sv_publisher(reader, sv);
+                }
                 else
+                {
                     json_skip_value(reader, tok);
+                }
             }
             else if (strcmp(key, "mac") == 0)
             {
@@ -1103,6 +1245,8 @@ static void parse_sv_array(json_reader_t *reader, SCD_Config_t *config)
 
 /**
  * @brief Parses the MMS configuration array from the JSON input stream.
+ * @param reader Reader positioned inside the MMS array.
+ * @param config Configuration receiving the MMS servers.
  */
 static void parse_mms_array(json_reader_t *reader, SCD_Config_t *config)
 {
@@ -1113,14 +1257,18 @@ static void parse_mms_array(json_reader_t *reader, SCD_Config_t *config)
     while ((tok = json_next_token(reader, val, sizeof(val))) != TOK_ARR_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_OBJ_START)
+        {
             break;
+        }
 
         s_parse_total_mms++;
 
         SCD_MMS_t *mms = NULL;
-        if (config->numMms < IDS_MAX_MMS)
+        if (config->numMms < s_cap_mms)
         {
             mms = &config->mms[config->numMms];
             memset(mms, 0, sizeof(SCD_MMS_t));
@@ -1129,12 +1277,18 @@ static void parse_mms_array(json_reader_t *reader, SCD_Config_t *config)
         while ((tok = json_next_token(reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
         {
             if (tok == TOK_COMMA)
+            {
                 continue;
+            }
             if (tok != TOK_STRING)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
             if (tok != TOK_COLON)
+            {
                 break;
+            }
             tok = json_next_token(reader, val, sizeof(val));
 
             if (mms == NULL)
@@ -1170,6 +1324,9 @@ static void parse_mms_array(json_reader_t *reader, SCD_Config_t *config)
 
 /**
  * @brief Parses the SCD JSON file into the provided configuration structure.
+ * @param file_path Converted JSON file to parse.
+ * @param config Configuration structure to fill.
+ * @return true when the file parsed and validated.
  */
 static bool parse_scd_json_file(const char *file_path, SCD_Config_t *config)
 {
@@ -1200,53 +1357,79 @@ static bool parse_scd_json_file(const char *file_path, SCD_Config_t *config)
     while ((tok = json_next_token(&s_scd_json_reader, key, sizeof(key))) != TOK_OBJ_END && tok != TOK_EOF)
     {
         if (tok == TOK_COMMA)
+        {
             continue;
+        }
         if (tok != TOK_STRING)
+        {
             break;
+        }
 
         tok = json_next_token(&s_scd_json_reader, val, sizeof(val));
         if (tok != TOK_COLON)
+        {
             break;
+        }
 
         if (strcmp(key, "scd") == 0)
         {
             tok = json_next_token(&s_scd_json_reader, val, sizeof(val));
             if (tok == TOK_OBJ_START)
+            {
                 parse_scd_header(&s_scd_json_reader, &config->header);
+            }
             else
+            {
                 json_skip_value(&s_scd_json_reader, tok);
+            }
         }
         else if (strcmp(key, "ieds") == 0)
         {
             tok = json_next_token(&s_scd_json_reader, val, sizeof(val));
             if (tok == TOK_ARR_START)
+            {
                 parse_ieds_array(&s_scd_json_reader, config);
+            }
             else
+            {
                 json_skip_value(&s_scd_json_reader, tok);
+            }
         }
         else if (strcmp(key, "goose") == 0)
         {
             tok = json_next_token(&s_scd_json_reader, val, sizeof(val));
             if (tok == TOK_ARR_START)
+            {
                 parse_goose_array(&s_scd_json_reader, config);
+            }
             else
+            {
                 json_skip_value(&s_scd_json_reader, tok);
+            }
         }
         else if (strcmp(key, "sv") == 0)
         {
             tok = json_next_token(&s_scd_json_reader, val, sizeof(val));
             if (tok == TOK_ARR_START)
+            {
                 parse_sv_array(&s_scd_json_reader, config);
+            }
             else
+            {
                 json_skip_value(&s_scd_json_reader, tok);
+            }
         }
         else if (strcmp(key, "mms") == 0)
         {
             tok = json_next_token(&s_scd_json_reader, val, sizeof(val));
             if (tok == TOK_ARR_START)
+            {
                 parse_mms_array(&s_scd_json_reader, config);
+            }
             else
+            {
                 json_skip_value(&s_scd_json_reader, tok);
+            }
         }
         else
         {
@@ -1272,7 +1455,110 @@ static bool parse_scd_json_file(const char *file_path, SCD_Config_t *config)
 }
 
 /**
+ * @brief Allocates and parses a JSON SCD into a buffer sized for its contents.
+ *
+ * Two passes over the same file, both streamed through the existing tokenizer:
+ *   1. count with the array capacities at zero (the parser then stores nothing),
+ *   2. allocate sizeof(SCD_Config_t) + the exact payload and parse for real.
+ *
+ * The result is the same structure the compile-time-maximum staging produced,
+ * only with the arrays sized to the file, so validation, binary commit and the
+ * active-config swap are unchanged. Returns NULL on rejection or allocation
+ * failure; the caller keeps whatever configuration it already had.
+ * @param path Converted JSON file to size and parse.
+ * @return Newly allocated configuration, or NULL on error.
+ */
+static SCD_Config_t *scd_config_alloc_from_json(const char *path)
+{
+    static SCD_Config_t count_probe;
+    size_t alloc_sz;
+
+    s_cap_ieds = 0;
+    s_cap_goose = 0;
+    s_cap_sv = 0;
+    s_cap_mms = 0;
+
+    memset(&count_probe, 0, sizeof(count_probe));
+    bool counted = parse_scd_json_file(path, &count_probe);
+    uint16_t n_ieds = s_parse_total_ieds;
+    uint16_t n_goose = s_parse_total_goose;
+    uint16_t n_sv = s_parse_total_sv;
+    uint16_t n_mms = s_parse_total_mms;
+
+    if (!counted)
+    {
+        s_cap_ieds = IDS_MAX_IEDS;
+        s_cap_goose = IDS_MAX_GOOSE;
+        s_cap_sv = IDS_MAX_SV;
+        s_cap_mms = IDS_MAX_MMS;
+        return NULL;
+    }
+
+    alloc_sz = sizeof(SCD_Config_t) +
+               ((size_t)n_ieds * sizeof(SCD_IED_t)) +
+               ((size_t)n_goose * sizeof(SCD_GOOSE_t)) +
+               ((size_t)n_sv * sizeof(SCD_SV_t)) +
+               ((size_t)n_mms * sizeof(SCD_MMS_t));
+
+    SysLog_Print(SYSLOG_LEVEL_INFO, "SCD",
+                 "JSON contains %u IEDs, %u GOOSE, %u SV, %u MMS; allocating %u bytes "
+                 "(free heap %u, min ever free %u)",
+                 n_ieds, n_goose, n_sv, n_mms, (unsigned int)alloc_sz,
+                 (unsigned int)xPortGetFreeHeapSize(),
+                 (unsigned int)xPortGetMinimumEverFreeHeapSize());
+
+    SCD_Config_t *cfg = (SCD_Config_t *)pvPortMalloc(alloc_sz);
+    if (cfg == NULL)
+    {
+        size_t free_now = (size_t)xPortGetFreeHeapSize();
+        SysLog_Print(SYSLOG_LEVEL_ERROR, "SCD",
+                     "Configuration allocation failed: needed %u bytes, free heap %u, "
+                     "min ever free %u; %s",
+                     (unsigned int)alloc_sz, (unsigned int)free_now,
+                     (unsigned int)xPortGetMinimumEverFreeHeapSize(),
+                     (free_now >= alloc_sz) ? "heap is fragmented (no contiguous block)"
+                                            : "insufficient free heap");
+        s_cap_ieds = IDS_MAX_IEDS;
+        s_cap_goose = IDS_MAX_GOOSE;
+        s_cap_sv = IDS_MAX_SV;
+        s_cap_mms = IDS_MAX_MMS;
+        return NULL;
+    }
+
+    memset(cfg, 0, sizeof(SCD_Config_t));
+    uint8_t *p = (uint8_t *)(cfg + 1);
+    cfg->ieds = (SCD_IED_t *)p;
+    p += (size_t)n_ieds * sizeof(SCD_IED_t);
+    cfg->goose = (SCD_GOOSE_t *)p;
+    p += (size_t)n_goose * sizeof(SCD_GOOSE_t);
+    cfg->sv = (SCD_SV_t *)p;
+    p += (size_t)n_sv * sizeof(SCD_SV_t);
+    cfg->mms = (SCD_MMS_t *)p;
+
+    s_cap_ieds = n_ieds;
+    s_cap_goose = n_goose;
+    s_cap_sv = n_sv;
+    s_cap_mms = n_mms;
+
+    bool parsed = parse_scd_json_file(path, cfg);
+
+    s_cap_ieds = IDS_MAX_IEDS;
+    s_cap_goose = IDS_MAX_GOOSE;
+    s_cap_sv = IDS_MAX_SV;
+    s_cap_mms = IDS_MAX_MMS;
+
+    if (!parsed)
+    {
+        vPortFree(cfg);
+        return NULL;
+    }
+    return cfg;
+}
+
+/**
  * @brief Validates the parsed SCD configuration for required fields and content.
+ * @param config Configuration to validate.
+ * @return true when the configuration is internally consistent.
  */
 static bool scd_validate_config(const SCD_Config_t *config)
 {
@@ -1293,6 +1579,7 @@ static bool scd_validate_config(const SCD_Config_t *config)
 
 /**
  * @brief Loads, validates, and commits the SCD configuration during startup or reload.
+ * @param is_startup true for the initial load, false for an upload-triggered reload.
  */
 static void scd_load_internal(bool is_startup)
 {
@@ -1357,35 +1644,10 @@ static void scd_load_internal(bool is_startup)
         return;
     }
 
-    size_t max_stage_sz = sizeof(SCD_Config_t) +
-                          (IDS_MAX_IEDS * sizeof(SCD_IED_t)) +
-                          (IDS_MAX_GOOSE * sizeof(SCD_GOOSE_t)) +
-                          (IDS_MAX_SV * sizeof(SCD_SV_t)) +
-                          (IDS_MAX_MMS * sizeof(SCD_MMS_t));
-
-    SCD_Config_t *staging = (SCD_Config_t *)pvPortMalloc(max_stage_sz);
+    SCD_Config_t *staging = scd_config_alloc_from_json(SCD_CONFIG_FILE_PATH);
     if (staging == NULL)
     {
         Security_UnlockSD();
-        SysLog_Print(SYSLOG_LEVEL_ERROR, "SCD", "Staging malloc failed (%u bytes)", (unsigned int)max_stage_sz);
-        return;
-    }
-
-    memset(staging, 0, sizeof(SCD_Config_t));
-    uint8_t *p = (uint8_t *)(staging + 1);
-    staging->ieds = (SCD_IED_t *)p;
-    p += IDS_MAX_IEDS * sizeof(SCD_IED_t);
-    staging->goose = (SCD_GOOSE_t *)p;
-    p += IDS_MAX_GOOSE * sizeof(SCD_GOOSE_t);
-    staging->sv = (SCD_SV_t *)p;
-    p += IDS_MAX_SV * sizeof(SCD_SV_t);
-    staging->mms = (SCD_MMS_t *)p;
-
-    g_scd_config_state = SCD_CONFIG_STATE_LOADING;
-
-    if (!parse_scd_json_file(SCD_CONFIG_FILE_PATH, staging))
-    {
-        vPortFree(staging);
         if (g_scd_active_config != NULL)
         {
             g_scd_config_state = SCD_CONFIG_STATE_READY;
@@ -1394,10 +1656,10 @@ static void scd_load_internal(bool is_startup)
         {
             g_scd_config_state = SCD_CONFIG_STATE_ERROR;
         }
-        Security_UnlockSD();
-        SysLog_Print(SYSLOG_LEVEL_ERROR, "SCD", "JSON parsing failed or rejected");
         return;
     }
+
+    g_scd_config_state = SCD_CONFIG_STATE_LOADING;
 
     if (!scd_validate_config(staging))
     {
@@ -1434,38 +1696,21 @@ static void scd_load_internal(bool is_startup)
         return;
     }
 
-    vPortFree(staging);
-
-    SCD_Config_t *active = ids_bin_load_from_file(IDS_CONFIG_BIN_PATH);
+    staging->isValid = 1;
     Security_UnlockSD();
 
-    if (active != NULL)
+    SCD_Config_Lock();
+    SCD_Config_t *old = g_scd_active_config;
+    g_scd_active_config = staging;
+    g_scd_config_state = SCD_CONFIG_STATE_READY;
+    SCD_Config_Unlock();
+    if (old != NULL)
     {
-        SCD_Config_Lock();
-        SCD_Config_t *old = g_scd_active_config;
-        g_scd_active_config = active;
-        g_scd_config_state = SCD_CONFIG_STATE_READY;
-        SCD_Config_Unlock();
-        if (old != NULL)
-        {
-            vPortFree(old);
-        }
-        SysLog_Print(SYSLOG_LEVEL_INFO, "SCD", "Configuration loaded: Version %lu (IEDs: %u, GOOSE: %u, SV: %u, MMS: %u)",
-                     (unsigned long)active->configVersion,
-                     active->numIeds, active->numGoose, active->numSv, active->numMms);
+        vPortFree(old);
     }
-    else
-    {
-        if (g_scd_active_config != NULL)
-        {
-            g_scd_config_state = SCD_CONFIG_STATE_READY;
-        }
-        else
-        {
-            g_scd_config_state = SCD_CONFIG_STATE_ERROR;
-        }
-        SysLog_Print(SYSLOG_LEVEL_ERROR, "SCD", "Failed to load committed binary config into RAM");
-    }
+    SysLog_Print(SYSLOG_LEVEL_INFO, "SCD", "Configuration loaded: Version %lu (IEDs: %u, GOOSE: %u, SV: %u, MMS: %u)",
+                 (unsigned long)staging->configVersion,
+                 staging->numIeds, staging->numGoose, staging->numSv, staging->numMms);
 }
 
 /**
@@ -1503,6 +1748,7 @@ void SCD_Config_RequestReload(void)
 
 /**
  * @brief Processes SCD configuration commands from the configuration queue.
+ * @param argument Unused task parameter.
  */
 void SCD_Config_Task(void const *argument)
 {
@@ -1529,6 +1775,7 @@ void SCD_Config_Task(void const *argument)
 
 /**
  * @brief Returns the current SCD configuration state.
+ * @return Current configuration state.
  */
 SCD_ConfigState_t SCD_Config_GetState(void)
 {
@@ -1537,6 +1784,7 @@ SCD_ConfigState_t SCD_Config_GetState(void)
 
 /**
  * @brief Returns a pointer to the active SCD configuration.
+ * @return Active configuration, or NULL when none is published.
  */
 const SCD_Config_t *SCD_Config_GetActive(void)
 {
@@ -1545,6 +1793,7 @@ const SCD_Config_t *SCD_Config_GetActive(void)
 
 /**
  * @brief Returns the version of the active SCD configuration.
+ * @return Version counter of the active configuration.
  */
 uint32_t SCD_Config_GetVersion(void)
 {
@@ -1582,6 +1831,8 @@ void SCD_Config_Unlock(void)
 
 /**
  * @brief Finds an IED by its configured name.
+ * @param ied_name IED name to look up.
+ * @return Matching IED, or NULL when not found.
  */
 const SCD_IED_t *SCD_Config_FindIEDByName(const char *ied_name)
 {
@@ -1602,6 +1853,8 @@ const SCD_IED_t *SCD_Config_FindIEDByName(const char *ied_name)
 
 /**
  * @brief Finds an IED by its IP address.
+ * @param ip_str Dotted-quad IP address to look up.
+ * @return Matching IED, or NULL when not found.
  */
 const SCD_IED_t *SCD_Config_FindIEDByIP(const char *ip_str)
 {
@@ -1622,6 +1875,9 @@ const SCD_IED_t *SCD_Config_FindIEDByIP(const char *ip_str)
 
 /**
  * @brief Finds a GOOSE configuration by APPID and optional MAC address.
+ * @param app_id APPID of the frame.
+ * @param mac Destination MAC address of the frame.
+ * @return Matching GOOSE control block, or NULL when not found.
  */
 const SCD_GOOSE_t *SCD_Config_FindGOOSE(uint16_t app_id, const uint8_t *mac)
 {
@@ -1645,6 +1901,9 @@ const SCD_GOOSE_t *SCD_Config_FindGOOSE(uint16_t app_id, const uint8_t *mac)
 
 /**
  * @brief Finds a GOOSE configuration by publisher IED and control block.
+ * @param ied IED name owning the control block.
+ * @param cb Control block name.
+ * @return Matching GOOSE control block, or NULL when not found.
  */
 const SCD_GOOSE_t *SCD_Config_FindGOOSEByControlBlock(const char *ied, const char *cb)
 {
@@ -1666,6 +1925,9 @@ const SCD_GOOSE_t *SCD_Config_FindGOOSEByControlBlock(const char *ied, const cha
 
 /**
  * @brief Finds an SV configuration by APPID and optional MAC address.
+ * @param app_id APPID of the frame.
+ * @param mac Destination MAC address of the frame.
+ * @return Matching SV control block, or NULL when not found.
  */
 const SCD_SV_t *SCD_Config_FindSV(uint16_t app_id, const uint8_t *mac)
 {
@@ -1689,6 +1951,8 @@ const SCD_SV_t *SCD_Config_FindSV(uint16_t app_id, const uint8_t *mac)
 
 /**
  * @brief Finds an SV configuration by its SV ID.
+ * @param sv_id SV identifier to look up.
+ * @return Matching SV control block, or NULL when not found.
  */
 const SCD_SV_t *SCD_Config_FindSVBySvId(const char *sv_id)
 {
@@ -1709,6 +1973,8 @@ const SCD_SV_t *SCD_Config_FindSVBySvId(const char *sv_id)
 
 /**
  * @brief Finds an MMS configuration by its IP address.
+ * @param ip_str Dotted-quad IP address to look up.
+ * @return Matching MMS server, or NULL when not found.
  */
 const SCD_MMS_t *SCD_Config_FindMMSByIP(const char *ip_str)
 {
@@ -1729,6 +1995,8 @@ const SCD_MMS_t *SCD_Config_FindMMSByIP(const char *ip_str)
 
 /**
  * @brief Finds an MMS configuration by its associated IED name.
+ * @param ied_name IED name owning the MMS server.
+ * @return Matching MMS server, or NULL when not found.
  */
 const SCD_MMS_t *SCD_Config_FindMMSByIED(const char *ied_name)
 {
@@ -1749,6 +2017,8 @@ const SCD_MMS_t *SCD_Config_FindMMSByIED(const char *ied_name)
 
 /**
  * @brief Calculates the total and active memory usage of the SCD configuration.
+ * @param total_bytes Optional output for the bytes held by the configuration.
+ * @param active_bytes Optional output for the bytes in use by the active configuration.
  */
 void SCD_Config_GetMemoryUsage(uint32_t *total_bytes, uint32_t *active_bytes)
 {

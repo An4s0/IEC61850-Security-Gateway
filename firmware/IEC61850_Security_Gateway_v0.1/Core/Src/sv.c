@@ -1,5 +1,6 @@
 #include "raw_eth.h"
 #include "sv.h"
+#include "health_monitor.h"
 #include "main.h"
 #include "system_config.h"
 #include "system_logger.h"
@@ -242,7 +243,9 @@ static bool parse_sv_frame(const uint8_t *data, uint16_t len, uint32_t now_ms, P
                     asdu_ptr += asdu_lb;
                     const uint8_t *elem_end = asdu_ptr + asdu_len;
                     if (elem_end > asdu_end)
+                    {
                         elem_end = asdu_end;
+                    }
 
                     while (asdu_ptr + 2 <= elem_end)
                     {
@@ -715,6 +718,7 @@ static Sv_Stats_t s_sv_stats = {0};
 
 /**
  * @brief Copies the current SV statistics to the provided structure.
+ * @param stats Destination structure; ignored when NULL.
  */
 void Sv_GetStats(Sv_Stats_t *stats)
 {
@@ -746,7 +750,10 @@ void Sv_Enqueue(struct pbuf *p)
 {
     if (p == NULL || SvPoolHandle == NULL || p->tot_len > SV_MAX_FRAME_SIZE)
     {
-        if (p != NULL) Accounting_Increment(ACCOUNT_SV, ACCOUNT_DROP_SIZE_OR_INIT);
+        if (p != NULL)
+        {
+            Accounting_Increment(ACCOUNT_SV, ACCOUNT_DROP_SIZE_OR_INIT);
+        }
         return;
     }
 
@@ -793,7 +800,8 @@ void Sv_Task(void const *argument)
             continue;
         }
 
-        osEvent evt = osMessageGet(SVQueueHandle, osWaitForever);
+        osEvent evt = osMessageGet(SVQueueHandle, HEALTH_BEAT_PERIOD_MS);
+        HealthMonitor_Beat(HEALTH_TASK_SV);
         if (evt.status == osEventMessage)
         {
             Sv_Frame_t *frame = (Sv_Frame_t *)evt.value.v;
