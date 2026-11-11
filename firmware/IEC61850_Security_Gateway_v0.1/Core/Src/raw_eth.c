@@ -5,7 +5,6 @@
 #include "system_config.h"
 #include <stdint.h>
 #include <stdbool.h>
-#include <limits.h>
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
@@ -17,18 +16,33 @@
 
 static PacketAccounting s_accounting;
 
+/**
+ * @brief Increments one accounting counter, saturating at UINT32_MAX instead of wrapping.
+ * @param protocol Protocol bucket that owns the counter.
+ * @param field Counter slot to increment.
+ */
 void Accounting_Increment(AccountProtocol protocol, AccountField field)
 {
     taskENTER_CRITICAL();
     if (s_accounting.values[protocol][field] != UINT32_MAX)
+    {
         s_accounting.values[protocol][field]++;
+    }
     else
+    {
         s_accounting.saturated = 1;
+    }
     if (field == ACCOUNT_PARSED)
+    {
         s_accounting.last_parsed_ms = HAL_GetTick();
+    }
     taskEXIT_CRITICAL();
 }
 
+/**
+ * @brief Copies the whole accounting snapshot out atomically.
+ * @param out Destination snapshot; must not be NULL.
+ */
 void Accounting_Get(PacketAccounting *out)
 {
     taskENTER_CRITICAL();
@@ -37,7 +51,11 @@ void Accounting_Get(PacketAccounting *out)
 }
 
 /**
- * @brief Checks whether an IPv4 packet contains MMS traffic based on active configuration.
+ * @brief Checks whether an IPv4 packet carries MMS traffic on the configured TCP port.
+ * @param p Packet buffer holding the frame, starting at the Ethernet header.
+ * @param ip_offset Offset of the IPv4 header inside the frame.
+ * @return true when the packet is IPv4/TCP and either port equals the configured MMS port;
+ *         false otherwise.
  */
 static inline bool is_mms_packet(struct pbuf *p, uint16_t ip_offset)
 {
@@ -84,15 +102,19 @@ static inline bool is_mms_packet(struct pbuf *p, uint16_t ip_offset)
 }
 
 /**
- * @brief Classifies an incoming raw Ethernet packet and dispatches to the appropriate protocol handler.
- * @param p Pointer to the lwIP packet buffer containing the raw Ethernet frame.
- * @return true if packet is a pure Layer-2 frame (SV or GOOSE) that should NOT be passed to lwIP;
- *         false if packet must continue through lwIP (IPv4/MMS, ARP, etc.).
+ * @brief Classifies a received raw Ethernet frame and dispatches it to the protocol handlers.
+ * @param p Packet buffer with the frame, starting at the Ethernet header.
+ * @param rx_ticks Receive timestamp used for GOOSE timing.
+ * @param rx_valid Whether the receive timestamp is considered valid.
+ * @return true for pure Layer-2 frames (SV or GOOSE) that must not continue through lwIP;
+ *         false for frames that must continue through lwIP (IPv4/MMS, ARP, others).
  */
 bool RawEth_Process(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
 {
     if (p == NULL)
+    {
         return false;
+    }
     if (p->tot_len < 14)
     {
         Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
@@ -127,7 +149,9 @@ bool RawEth_Process(struct pbuf *p, uint64_t rx_ticks, bool rx_valid)
             Mms_Enqueue(p);
         }
         else
+        {
             Accounting_Increment(ACCOUNT_OTHER, ACCOUNT_RX);
+        }
         return false;
 
     case RAW_ETH_TYPE_VLAN:

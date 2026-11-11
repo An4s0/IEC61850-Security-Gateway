@@ -34,14 +34,16 @@
 /* Within 'USER CODE' section, code will be kept by default at each generation */
 /* USER CODE BEGIN 0 */
 #include "raw_eth.h"
+#include "runtime_stats.h"
 #include "http_api.h"
+#include "health_monitor.h"
 #include "system_logger.h"
 
 /* USER CODE END 0 */
 
 /* Private define ------------------------------------------------------------*/
 /* The time to block waiting for input. */
-#define TIME_WAITING_FOR_INPUT (portMAX_DELAY)
+#define TIME_WAITING_FOR_INPUT (HEALTH_BEAT_PERIOD_MS)
 /* Time to block waiting for transmissions to finish */
 #define ETHIF_TX_TIMEOUT (2000U)
 /* USER CODE BEGIN OS_THREAD_STACK_SIZE_WITH_RTOS */
@@ -125,7 +127,213 @@ ETH_DMADescTypeDef DMATxDscrTab[ETH_TX_DESC_CNT] __attribute__((section(".TxDesc
 /* USER CODE BEGIN 2 */
 static volatile Ethernet_Diagnostics_t s_eth_diagnostics;
 
-#define ETH_DIAG_INC(field) do { if (s_eth_diagnostics.field != UINT32_MAX) s_eth_diagnostics.field++; } while (0)
+#define ETH_DIAG_INC(field)                    \
+  do                                           \
+  {                                            \
+    if (s_eth_diagnostics.field != UINT32_MAX) \
+      s_eth_diagnostics.field++;               \
+  } while (0)
+
+static uint32_t EthDiag_IcmpChecksum(const uint8_t *frame, uint32_t ip_total_len)
+{
+  const uint8_t *icmp = frame + 14U + 20U;
+  uint32_t nbytes;
+  uint32_t sum = 0U;
+
+  if (ip_total_len <= 20U)
+  {
+    return 0xFFFFU;
+  }
+  nbytes = ip_total_len - 20U;
+
+  while (nbytes > 1U)
+  {
+    sum += ((uint32_t)icmp[0] << 8) | (uint32_t)icmp[1];
+    icmp += 2;
+    nbytes -= 2U;
+  }
+  if (nbytes != 0U)
+  {
+    sum += (uint32_t)icmp[0] << 8;
+  }
+  while ((sum >> 16) != 0U)
+  {
+    sum = (sum & 0xFFFFU) + (sum >> 16);
+  }
+  return (~sum) & 0xFFFFU;
+}
+
+#define ETH_MAC_RX_FIFO_SIZE 1024U
+
+/*
+ * Returns the frame size declared by the frame's own protocol header, or 0 when
+ * the frame carries no length that can be trusted.
+ *
+ * Sources used, all inside the bytes the DMA already delivered:
+ *   IPv4   - total length field
+ *   IPv6   - payload length field (+40 byte header)
+ *   GOOSE  0x88B8 / SV 0x88BA - the second 16-bit field of the IEC 61850
+ *            header. This firmware and its simulator use it as the total
+ *            message length (header included, parser: pdu_len = length - 8);
+ *            the standards-compliant variant that excludes the 8-byte header is
+ *            accepted as well, because both are checked against the descriptor
+ *            length and only an exact one-byte match is ever used.
+ */
+static uint32_t EthRx_DeclaredFrameLength(const uint8_t *hdr, uint32_t avail, uint32_t tot_len)
+{
+  uint32_t off = 14U;
+  uint32_t etype;
+
+  if (avail < 18U)
+  {
+    return 0U;
+  }
+
+  etype = ((uint32_t)hdr[12] << 8) | (uint32_t)hdr[13];
+  if ((etype == 0x8100U) || (etype == 0x88A8U))
+  {
+    if (avail < 22U)
+    {
+      return 0U;
+    }
+    off = 18U;
+    etype = ((uint32_t)hdr[16] << 8) | (uint32_t)hdr[17];
+  }
+
+  if (etype == 0x0800U)
+  {
+    if ((avail < (off + 4U)) || ((hdr[off] >> 4) != 4U))
+    {
+      return 0U;
+    }
+    return off + (((uint32_t)hdr[off + 2] << 8) | (uint32_t)hdr[off + 3]);
+  }
+
+  if (etype == 0x86DDU)
+  {
+    if (avail < (off + 6U))
+    {
+      return 0U;
+    }
+    return off + 40U + (((uint32_t)hdr[off + 4] << 8) | (uint32_t)hdr[off + 5]);
+  }
+
+  if ((etype == 0x88B8U) || (etype == 0x88BAU))
+  {
+    uint32_t msg_len;
+
+    if (avail < (off + 8U))
+    {
+      return 0U;
+    }
+    msg_len = ((uint32_t)hdr[off + 2] << 8) | (uint32_t)hdr[off + 3];
+    if (msg_len < 8U)
+    {
+      return 0U;
+    }
+    if ((off + msg_len) == (tot_len + 1U))
+    {
+      return off + msg_len;
+    }
+    if ((off + 8U + msg_len) == (tot_len + 1U))
+    {
+      return off + 8U + msg_len;
+    }
+  }
+
+  return 0U;
+}
+
+static uint32_t EthDma_CorrectRxLength(struct pbuf *p)
+{
+  uint8_t hdr[54];
+  uint32_t avail;
+  uint32_t declared;
+
+  if ((p == NULL) || (p->next != NULL))
+  {
+    return 0U;
+  }
+
+  avail = pbuf_copy_partial(p, hdr, sizeof(hdr), 0U);
+  declared = EthRx_DeclaredFrameLength(hdr, avail, p->tot_len);
+  if (declared == 0U)
+  {
+    if (p->tot_len > ETH_MAC_RX_FIFO_SIZE)
+    {
+      ETH_DIAG_INC(rx_len_unverifiable);
+    }
+    return 0U;
+  }
+
+  if ((declared == (p->tot_len + 1U)) && (declared <= (uint32_t)ETH_RX_BUF_SIZE))
+  {
+    p->len++;
+    p->tot_len++;
+    return 1U;
+  }
+  return 0U;
+}
+
+/*
+ * DMA-reachable RAM on STM32F767ZI: SRAM1 0x20020000-0x2007BFFF and
+ * SRAM2 0x2007C000-0x2007FFFF. DTCM (0x20000000-0x2001FFFF) is not reachable
+ * by the Ethernet DMA, and the linker RAM region starts inside DTCM.
+ */
+#define ETH_DMA_RAM_START 0x20020000UL
+#define ETH_DMA_RAM_END 0x20080000UL
+
+static bool EthDma_IsAccessible(uint32_t addr, uint32_t size)
+{
+  if (size == 0U || addr < ETH_DMA_RAM_START)
+  {
+    return false;
+  }
+  return (addr + size - 1U) < ETH_DMA_RAM_END;
+}
+
+extern uint8_t memp_memory_RX_POOL_base[];
+
+#define RX_LAT_BUCKETS 4
+static const uint32_t s_rx_lat_bucket_us[RX_LAT_BUCKETS] = {100U, 500U, 1000U, 5000U};
+
+typedef struct
+{
+  uint32_t min;
+  uint32_t max;
+  uint64_t sum;
+  uint32_t count;
+  uint32_t over[RX_LAT_BUCKETS];
+} rx_latency_t;
+
+static volatile uint32_t s_rx_isr_cnt;
+static volatile uint8_t s_rx_isr_valid;
+static rx_latency_t s_rx_irq_to_task;
+static rx_latency_t s_rx_process;
+
+static void rx_latency_record(rx_latency_t *acc, uint32_t us)
+{
+  if (acc->count == 0U || us < acc->min)
+  {
+    acc->min = us;
+  }
+  if (us > acc->max)
+  {
+    acc->max = us;
+  }
+  acc->sum += us;
+  if (acc->count != UINT32_MAX)
+  {
+    acc->count++;
+  }
+  for (uint32_t i = 0U; i < RX_LAT_BUCKETS; i++)
+  {
+    if (us > s_rx_lat_bucket_us[i] && acc->over[i] != UINT32_MAX)
+    {
+      acc->over[i]++;
+    }
+  }
+}
 
 /* USER CODE END 2 */
 
@@ -134,6 +342,17 @@ osSemaphoreId TxPktSemaphore = NULL; /* Semaphore to signal transmit packet comp
 
 /* Global Ethernet handle */
 ETH_HandleTypeDef heth;
+
+/**
+ * @brief Selects RX FIFO threshold mode (RSF = 0) so frames larger than the
+ *        1024-byte MAC RX FIFO can be received.
+ *        The DMA receive path must be stopped (DMAOMR.ST = 0).
+ */
+static void EthDma_SelectRxThresholdMode(void)
+{
+  CLEAR_BIT(heth.Instance->DMAOMR, ETH_DMAOMR_RSF);
+}
+
 ETH_TxPacketConfig TxConfig;
 extern struct netif gnetif;
 static volatile uint8_t s_eth_good_pkt_received = 0;
@@ -170,6 +389,9 @@ void pbuf_free_custom(struct pbuf *p);
  */
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *handlerEth)
 {
+  /* Timestamp in the ISR so the scheduled wake-up latency can be measured. */
+  s_rx_isr_cnt = RunTimeStats_GetCount();
+  s_rx_isr_valid = 1U;
   osSemaphoreRelease(RxPktSemaphore);
 }
 /**
@@ -189,6 +411,10 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *handlerEth)
 void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *handlerEth)
 {
   ETH_DIAG_INC(dma_error_callbacks);
+  /* Latch the raw DMA status so a drop can be attributed (RU / RWT / FBI / AIS
+   * etc.) instead of being silently swallowed. DMASR bits are cleared by the
+   * HAL before it calls this callback, so the value is read defensively. */
+  s_eth_diagnostics.dmasr = (uint32_t)handlerEth->Instance->DMASR;
   if ((HAL_ETH_GetDMAError(handlerEth) & ETH_DMASR_RBUS) == ETH_DMASR_RBUS)
   {
     ETH_DIAG_INC(rx_buffer_unavailable);
@@ -200,9 +426,25 @@ void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *handlerEth)
 void Ethernet_GetDiagnostics(Ethernet_Diagnostics_t *out)
 {
   if (out == NULL)
+  {
     return;
+  }
   taskENTER_CRITICAL();
   *out = s_eth_diagnostics;
+  out->rx_irq_to_task_min_us = s_rx_irq_to_task.count ? s_rx_irq_to_task.min : 0U;
+  out->rx_irq_to_task_max_us = s_rx_irq_to_task.max;
+  out->rx_irq_to_task_avg_us = s_rx_irq_to_task.count
+                                   ? (uint32_t)(s_rx_irq_to_task.sum / s_rx_irq_to_task.count)
+                                   : 0U;
+  out->rx_irq_to_task_samples = s_rx_irq_to_task.count;
+  out->rx_irq_to_task_over_1ms = s_rx_irq_to_task.over[2];
+  out->rx_process_min_us = s_rx_process.count ? s_rx_process.min : 0U;
+  out->rx_process_max_us = s_rx_process.max;
+  out->rx_process_avg_us = s_rx_process.count
+                               ? (uint32_t)(s_rx_process.sum / s_rx_process.count)
+                               : 0U;
+  out->rx_process_samples = s_rx_process.count;
+  out->rx_process_over_1ms = s_rx_process.over[2];
   taskEXIT_CRITICAL();
 }
 
@@ -258,12 +500,16 @@ static void low_level_init(struct netif *netif)
     heth.Instance->PTPTSLUR = 0U;
     SET_BIT(heth.Instance->PTPTSCR, ETH_PTPTSCR_TSSTI);
     uint32_t timeout = 1000000U;
-    while ((heth.Instance->PTPTSCR & ETH_PTPTSCR_TSSTI) && --timeout) { }
+    while ((heth.Instance->PTPTSCR & ETH_PTPTSCR_TSSTI) && --timeout)
+    {
+    }
     if (timeout != 0U)
     {
       uint32_t initial = heth.Instance->PTPTSLR;
       uint32_t running_timeout = 1000000U;
-      while (heth.Instance->PTPTSLR == initial && --running_timeout) { }
+      while (heth.Instance->PTPTSLR == initial && --running_timeout)
+      {
+      }
       s_rx_clock_ready = running_timeout != 0U;
     }
   }
@@ -290,6 +536,34 @@ static void low_level_init(struct netif *netif)
 
   /* Initialize the RX POOL */
   LWIP_MEMPOOL_INIT(RX_POOL);
+
+  /* USER CODE BEGIN DMA_REGION_CHECK */
+  /*
+   * DMA reachability guard.
+   *
+   * The Cortex-M7 places its 128 KB DTCM at 0x20000000-0x2001FFFF. Ethernet DMA
+   * cannot access DTCM, while the linker `RAM` region starts there, so any
+   * static DMA buffer that happens to be linked into the first 128 KB of .bss
+   * would receive nothing and corrupt silently. Ethernet RX/TX are the only DMA
+   * users in this firmware (SDMMC is polled FIFO, not DMA) and D-Cache is
+   * disabled, so the only requirement is placement in SRAM1/SRAM2.
+   */
+  {
+    uintptr_t rx_pool = (uintptr_t)memp_memory_RX_POOL_base;
+
+    if (!EthDma_IsAccessible((uint32_t)DMARxDscrTab, sizeof(DMARxDscrTab)) ||
+        !EthDma_IsAccessible((uint32_t)DMATxDscrTab, sizeof(DMATxDscrTab)) ||
+        !EthDma_IsAccessible((uint32_t)rx_pool, ETH_RX_BUFFER_CNT * sizeof(RxBuff_t)))
+    {
+      s_eth_diagnostics.dma_region_violations++;
+      SysLog_Print(SYSLOG_LEVEL_ERROR, "ETH",
+                   "DMA buffer outside SRAM1/SRAM2 (rxdesc=%08lx txdesc=%08lx pool=%08lx)",
+                   (unsigned long)(uintptr_t)DMARxDscrTab,
+                   (unsigned long)(uintptr_t)DMATxDscrTab,
+                   (unsigned long)rx_pool);
+    }
+  }
+  /* USER CODE END DMA_REGION_CHECK */
 
 #if LWIP_ARP || LWIP_ETHERNET
 
@@ -349,6 +623,7 @@ static void low_level_init(struct netif *netif)
   if (hal_eth_init_status == HAL_OK)
   {
     /* Start ETH DMA and interrupts once cleanly at initialization */
+    EthDma_SelectRxThresholdMode();
     HAL_ETH_Start_IT(&heth);
     netif_set_link_down(netif);
   }
@@ -425,6 +700,17 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
   TxConfig.TxBuffer = Txbuffer;
   TxConfig.pData = p;
 
+  /* Transmit accounting (diagnostic): records the largest frame handed to the
+   * driver and whether the transmission was accepted. */
+  if (p->tot_len > s_eth_diagnostics.tx_max_len)
+  {
+    s_eth_diagnostics.tx_max_len = p->tot_len;
+  }
+  if (s_eth_diagnostics.tx_frames != UINT32_MAX)
+  {
+    s_eth_diagnostics.tx_frames++;
+  }
+
   pbuf_ref(p);
 
   do
@@ -456,6 +742,15 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p)
       }
     }
   } while (errval == ERR_BUF);
+
+  if (errval != ERR_OK)
+  {
+    if (s_eth_diagnostics.tx_failures != UINT32_MAX)
+    {
+      s_eth_diagnostics.tx_failures++;
+    }
+    s_eth_diagnostics.tx_last_err = (uint32_t)errval;
+  }
 
   return errval;
 }
@@ -500,11 +795,99 @@ static void ethernetif_input(void const *argument)
   {
     if (osSemaphoreWait(RxPktSemaphore, TIME_WAITING_FOR_INPUT) == osOK)
     {
+      uint32_t t_start = RunTimeStats_GetCount();
+      if (s_rx_isr_valid)
+      {
+        s_rx_isr_valid = 0U;
+        rx_latency_record(&s_rx_irq_to_task, t_start - s_rx_isr_cnt);
+      }
       do
       {
         p = low_level_input(netif);
         if (p != NULL)
         {
+          uint32_t raw_len = p->tot_len;
+          bool corrected = (EthDma_CorrectRxLength(p) != 0U);
+          if (corrected)
+          {
+            ETH_DIAG_INC(rx_len_corrected);
+          }
+          /* Record descriptor length against corrected length for every large
+           * frame, whatever its EtherType, so the correction can be verified
+           * for GOOSE, SV and raw traffic that has no IP header. */
+          if (raw_len > ETH_MAC_RX_FIFO_SIZE)
+          {
+            s_eth_diagnostics.rx_last_raw_len = raw_len;
+            s_eth_diagnostics.rx_last_fixed_len = p->tot_len;
+            if ((p->next == NULL) && (p->tot_len >= 4U))
+            {
+              const uint8_t *fr = (const uint8_t *)p->payload;
+              s_eth_diagnostics.rx_last_tail =
+                  ((uint32_t)fr[p->tot_len - 4U] << 24) |
+                  ((uint32_t)fr[p->tot_len - 3U] << 16) |
+                  ((uint32_t)fr[p->tot_len - 2U] << 8) |
+                  (uint32_t)fr[p->tot_len - 1U];
+            }
+          }
+          /* Length accounting: a large frame that arrives truncated here would
+           * explain a silent LwIP drop without any error counter moving. */
+          uint32_t flen = p->tot_len;
+          if (flen > s_eth_diagnostics.rx_max_frame_len)
+          {
+            s_eth_diagnostics.rx_max_frame_len = flen;
+          }
+          if (flen >= 1024U)
+          {
+            ETH_DIAG_INC(rx_frames_ge_1024);
+          }
+          if (flen >= 1400U)
+          {
+            ETH_DIAG_INC(rx_frames_ge_1400);
+          }
+          /* Controlled probe, applied to every ICMP echo request so the same
+           * measurement exists for small and large frames: record the pbuf
+           * length the driver delivered against the length the IP header
+           * declares. Any shortfall here is a driver/descriptor problem; a
+           * match means LwIP, not the MAC/DMA, discarded the frame. */
+          {
+            uint8_t hdr[40];
+            if ((flen >= sizeof(hdr)) &&
+                (pbuf_copy_partial(p, hdr, sizeof(hdr), 0) == sizeof(hdr)) &&
+                (hdr[12] == 0x08U) && (hdr[13] == 0x00U) &&
+                (hdr[23] == 1U) && (hdr[34] == 8U))
+            {
+              s_eth_diagnostics.rx_last_tot_len = flen;
+              s_eth_diagnostics.rx_last_etype = 0x0800U;
+              s_eth_diagnostics.rx_last_ip_total_len =
+                  ((uint32_t)hdr[16] << 8) | hdr[17];
+              s_eth_diagnostics.rx_probe_ihl = (uint32_t)(hdr[14] & 0x0FU);
+              s_eth_diagnostics.rx_probe_icmp_type = hdr[34];
+              s_eth_diagnostics.rx_probe_icmp_sum =
+                  ((uint32_t)hdr[36] << 8) | hdr[37];
+              s_eth_diagnostics.rx_probe_dmasr = heth.Instance->DMASR;
+              /* The byte the descriptor did not count: is it the real last byte
+               * of the frame, or a stale byte left by the previous frame? */
+              if (p->next == NULL)
+              {
+                const uint8_t *frame = (const uint8_t *)p->payload;
+                if (flen < 1536U)
+                {
+                  s_eth_diagnostics.rx_probe_beyond = frame[flen];
+                  s_eth_diagnostics.rx_probe_last = frame[flen - 1U];
+                }
+              }
+              /* Is the whole message physically in the DMA buffer even when
+               * the reported length is short? */
+              if ((p->next == NULL) && (s_eth_diagnostics.rx_probe_ihl == 5U) &&
+                  (p->len >= (14U + s_eth_diagnostics.rx_last_ip_total_len)))
+              {
+                s_eth_diagnostics.rx_probe_icmp_verify =
+                    EthDiag_IcmpChecksum((const uint8_t *)p->payload,
+                                         s_eth_diagnostics.rx_last_ip_total_len);
+              }
+              ETH_DIAG_INC(rx_probe_count);
+            }
+          }
           /* USER CODE BEGIN RawEth Input */
           /* HAL_ETH_ReadData copied the last descriptor's timestamp before
            * rebuilding it; attach it to this exact returned pbuf. */
@@ -517,15 +900,19 @@ static void ethernetif_input(void const *argument)
             pbuf_free(p);
           }
           else
-          /* USER CODE END RawEth Input */
-          if (netif->input(p, netif) != ERR_OK)
-          {
-            ETH_DIAG_INC(lwip_input_failures);
-            pbuf_free(p);
-          }
+            /* USER CODE END RawEth Input */
+            if (netif->input(p, netif) != ERR_OK)
+            {
+              ETH_DIAG_INC(lwip_input_failures);
+              pbuf_free(p);
+            }
         }
       } while (p != NULL);
+      rx_latency_record(&s_rx_process, RunTimeStats_GetCount() - t_start);
     }
+    /* Progress report for the health gate: reached on every wake-up and on
+     * every bounded-wait timeout, but never while stuck inside the drain loop. */
+    HealthMonitor_Beat(HEALTH_TASK_ETH_RX);
   }
 }
 
@@ -896,7 +1283,10 @@ void ethernet_link_thread(void const *argument)
         if (was_enabled)
         {
           heth.Instance->MACCR &= ~(ETH_MACCR_TE | ETH_MACCR_RE);
-          for (volatile int d = 0; d < 1000; d++) { __NOP(); }
+          for (volatile int d = 0; d < 1000; d++)
+          {
+            __NOP();
+          }
         }
 
         if (duplex == ETH_FULLDUPLEX_MODE)
@@ -925,6 +1315,7 @@ void ethernet_link_thread(void const *argument)
         /* Ensure ETH DMA is running */
         if (heth.gState != HAL_ETH_STATE_STARTED)
         {
+          EthDma_SelectRxThresholdMode();
           HAL_ETH_Start_IT(&heth);
         }
 
@@ -940,10 +1331,9 @@ void ethernet_link_thread(void const *argument)
         UNLOCK_TCPIP_CORE();
 
         last_phy_state = PHYLinkState;
-        SysLog_Print(SYSLOG_LEVEL_INFO, "ETH", "Link UP: %s, %s (IP=%s, HTTP=%s)",
+        SysLog_Print(SYSLOG_LEVEL_INFO, "ETH", "Link UP: %s, %s (IP=%s)",
                      speed_str, duplex_str,
-                     ip4addr_ntoa(netif_ip4_addr(netif)),
-                     HTTP_API_IsListening() ? "listening:8080" : "NOT listening");
+                     ip4addr_ntoa(netif_ip4_addr(netif)));
       }
     }
 
@@ -1013,7 +1403,13 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
     p->tot_len += Length;
   }
 
-  /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale. */
+  /* Invalidate data cache because Rx DMA's writing to physical memory makes it stale.
+   *
+   * D-Cache state: DISABLED in this firmware (only SCB_EnableICache() is called
+   * in main()), so this is currently a no-op and no TX-side clean is required.
+   * If D-Cache is ever enabled, this call alone is NOT sufficient: TX buffers
+   * must be cleaned before HAL_ETH_TransmitFrame and the descriptors must be
+   * cleaned/invalidated too. Do not enable D-Cache without completing that work. */
   SCB_InvalidateDCache_by_Addr((uint32_t *)buff, Length);
 
   /* USER CODE END HAL ETH RxLinkCallback */
