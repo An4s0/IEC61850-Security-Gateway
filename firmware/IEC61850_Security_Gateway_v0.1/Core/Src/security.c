@@ -685,8 +685,9 @@ static FRESULT reconcile_batch(FIL *file)
     if (pending > (FSIZE_t)s_batch_len)
     {
         return FR_INT_ERR;
+    }
 
-        FRESULT res = f_lseek(file, s_batch_offset);
+    FRESULT res = f_lseek(file, s_batch_offset);
         if (res != FR_OK)
         {
             return res;
