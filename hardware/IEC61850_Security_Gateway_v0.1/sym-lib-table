@@ -1,0 +1,4 @@
+(sym_lib_table
+	(version 7)
+	(lib (name "LMR36520ADDAR") (type "KiCad") (uri "${KIPRJMOD}/lib/LMR36520ADDAR/LMR36520ADDAR.kicad_sym") (options "") (descr ""))
+)
