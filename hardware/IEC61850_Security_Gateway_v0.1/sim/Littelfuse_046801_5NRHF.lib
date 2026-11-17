@@ -1,0 +1,17 @@
+* Preliminary behavioral fuse for LTspice 26; 25 C only
+* Cold resistance 44 milliohms from Littelfuse 468 datasheet.
+* Average curve approximate digitization. Not a clearing/arc model.
+.subckt Littelfuse_046801_5NRHF p n
+Vsense p a 0
+Rlink a n R=if(V(latch)>0.5,1e9,0.044*(1+0.6868687*limit(V(heat),0,1)))
+* Thermal state: dissipative memory, approximate curve-derived heating.
+.func tt(x) {if(x>21.05,0.288/max(x*x,1n),exp(table(ln(max(x,1u)),ln(2.5),ln(1000),ln(2.76),ln(100),ln(3.02),ln(10),ln(3.43),ln(1),ln(3.97),ln(0.3014),ln(4.76),ln(0.1),ln(5.60),ln(0.05233),ln(6.47),ln(0.03014),ln(8.65),ln(0.01),ln(11.99),ln(0.00294),ln(14.90),ln(0.00150),ln(21.05),ln(0.00065),ln(100),ln(0.0000288))))}
+Bheat 0 heat I=if(abs(I(Vsense))<2.5,(I(Vsense)/2.5)**2/30,1/(30*(1-exp(-tt(abs(I(Vsense)))/30))))
+Cheat heat 0 1 IC=0
+Rcool heat 0 30
+* State-holding fuse latch; state persists after the triggering pulse.
+Blatch 0 latch I=if(V(heat)>=1,1000000,if(V(latch)>0.5,1p,0))*if(V(latch)<1,1,0)
+Clatch latch 0 1 IC=0
+Rretain latch 0 1e12
+.ends Littelfuse_046801_5NRHF
+

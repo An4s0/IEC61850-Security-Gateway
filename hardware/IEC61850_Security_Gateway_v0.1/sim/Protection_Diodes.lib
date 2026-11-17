@@ -1,0 +1,7 @@
+* Datasheet-fitted 25 C approximations; not manufacturer-supplied SPICE models.
+* Littelfuse SMCJ40A: BV midpoint 46.75 V at 1 mA;
+* Rs fitted to 64.5 V at 23.3 A. Cjo is assumed; pulse heating not modeled.
+.model SMCJ40A D(Is=10n N=1.2 Rs=0.75 Bv=46.75 Ibv=1m Cjo=500p Vj=0.7 M=0.4)
+* STPS2H100A: fit conservative 25 C maximum Vf points 0.79 V / 2 A
+* and 0.88 V / 4 A. Reverse capacitance is approximate. No thermal model.
+.model STPS2H100A D(Is=1.8e-10 N=1.2 Rs=0.034 Bv=100 Ibv=1u Cjo=150p Vj=0.7 M=0.5 Eg=0.69)

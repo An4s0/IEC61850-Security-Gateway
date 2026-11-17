@@ -1,0 +1,13 @@
+Version 4
+SymbolType BLOCK
+LINE Normal 0 0 16 0
+LINE Normal 80 0 96 0
+RECTANGLE Normal 16 -16 80 16
+PIN 0 0 LEFT 8
+PINATTR PinName IN
+PINATTR SpiceOrder 1
+PIN 96 0 RIGHT 8
+PINATTR PinName OUT
+PINATTR SpiceOrder 2
+SYMATTR Prefix X
+SYMATTR Value Littelfuse_046801_5NRHF
